@@ -5,3 +5,4 @@ Just a learning doodle. Might grow into a self-contained testbed to study matmul
 ```
 hipcc matmul.hip -o /tmp/matmul && /tmp/matmul
 ```
+

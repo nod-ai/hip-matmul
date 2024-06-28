@@ -215,3 +215,4 @@ int main() {
   checkMmt8dResults(A_host_data.data(), B_host_data.data(), C_host_data.data(),
                     M0, M1, M2, M3, N0, N1, N2, N3, K0, K1, K2, K3);
 }
+

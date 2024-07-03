@@ -237,8 +237,8 @@ void test(const MmtKernel &kernel) {
 }
 
 template <int T_M_tile0, int T_N_tile0, int T_K_tile0>
-class MmtKernelGeneric : public MmtKernel {
-  virtual const char *name() const override { return "MmtKernelGeneric"; }
+class MmtKernel_generic : public MmtKernel {
+  virtual const char *name() const override { return "MmtKernel_generic"; }
   virtual int M_tile0() const override { return T_M_tile0; }
   virtual int N_tile0() const override { return T_N_tile0; }
   virtual int K_tile0() const override { return T_K_tile0; }
@@ -280,49 +280,57 @@ class MmtKernelGeneric : public MmtKernel {
   }
 };
 
-#if 0
-struct mmt_mfma_f32_16x16x4f32 {
-  static constexpr int Mblock = 64;
-  static constexpr int Nblock = 1;
-  static constexpr int M_tile0 = 1;
-  static constexpr int N_tile0 = 1;
-  static constexpr int K_tile0 = 4;
-  static constexpr int M2 = 4;
-  static constexpr int N2 = 16;
-  static constexpr int K2 = 1;
-  static constexpr int M3 = 4;
-  static constexpr int N3 = 1;
-  static constexpr int K3 = 1;
+class MmtKernel_amdgcn_mfma_f32_16x16x4f32_allrowmajor : public MmtKernel {
+  virtual const char *name() const override {
+    return "MmtKernel_amdgcn_mfma_f32_16x16x4f32_allrowmajor";
+  }
+  virtual int M_tile0() const override { return 16; }
+  virtual int N_tile0() const override { return 16; }
+  virtual int K_tile0() const override { return 4; }
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) { return 4 * m + k; };
+  }
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) { return 16 * k + n; };
+  }
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) { return 16 * m + n; };
+  }
+  virtual int num_threads() const override { return 64; }
+  virtual mmt_func_t mmt_func() const override { return run; };
   __global__ static void run(const float *A_data, const float *B_data,
                              float *C_data, int M_outer, int N_outer,
                              int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
-    floatx4_t c = {0};
+    floatx4_t acc = {0};
 
     int m_outer = blockIdx.x;
     int n_outer = blockIdx.y;
-    int t = threadIdx.x;
+    int lane = threadIdx.x;
+    int ai = lane % 16;
+    int ak = lane / 16;
+    int bj = lane % 16;
+    int bk = lane / 16;
 
-    int k_tile0 = t / 16;
-    int m2 = (t % 16) / 4;
-    int m3 = t % 4;
-    int n2 = t % 16;
-
-    const float *A_ptr = A_data + 16 * k_tile0 + 4 * m2;
-    const float *B_ptr = B_data + t;
+    const float *A_ptr = A_data + m_outer * K_outer * 64 + ai * 4 + ak;
+    const float *B_ptr = B_data + n_outer * K_outer * 64 + bk * 16 + bj;
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
-      c = __builtin_amdgcn_mfma_f32_16x16x4f32(*A_ptr, *B_ptr, c, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(*A_ptr, *B_ptr, acc, 0, 0, 0);
       A_ptr += 64;
       B_ptr += 64;
     }
 
-    for (int m3 = 0; m3 < 4; ++m3) {
-      C_data[64 * m2 + 4 * n2 + m3] = c[m3];
+    for (int gpr = 0; gpr < 4; ++gpr) {
+      int ci = 4 * (lane / 16) + gpr;
+      int cj = lane % 16;
+      C_data[m_outer * N_outer * 256 + n_outer * 256 + ci * 16 + cj] = acc[gpr];
     }
     (void)M_outer;
   }
 };
-#endif
 
-int main() { test(MmtKernelGeneric<3, 5, 2>()); }
+int main() {
+  test(MmtKernel_generic<3, 5, 2>());
+  test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_allrowmajor());
+}

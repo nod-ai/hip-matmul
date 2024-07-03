@@ -6,8 +6,10 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cxxabi.h>
 #include <functional>
 #include <random>
+#include <typeinfo>
 #include <vector>
 
 void hip_check_impl(hipError_t hip_error_code, const char *condstr,
@@ -113,13 +115,11 @@ void checkMmtResults(const float *A_data, const float *B_data,
   }
 }
 
-typedef void (*mmt_func_t)(const float *, const float *, float *, int, int,
-                           int);
+typedef void (*mmt_func_t)(const float *, const float *, float *, int, int);
 
 class MmtKernel {
 public:
   virtual ~MmtKernel(){};
-  virtual const char *name() const = 0;
   virtual int M_tile0() const = 0;
   virtual int N_tile0() const = 0;
   virtual int K_tile0() const = 0;
@@ -178,14 +178,16 @@ void test(const MmtKernel &kernel) {
   const dim3 grid_dim(s.M_outer, s.N_outer);
   const dim3 block_dim(kernel.num_threads());
 
-  printf("%s: MxNxK outer=(%dx%dx%d) tile0=(%dx%dx%d) num_threads=%d\n",
-         kernel.name(), s.M_outer, s.N_outer, s.K_outer, s.M_tile0, s.N_tile0,
-         s.K_tile0, kernel.num_threads());
+  char *name =
+      abi::__cxa_demangle(typeid(kernel).name(), nullptr, nullptr, nullptr);
+  printf("%s: MxNxK outer=(%dx%dx%d) tile0=(%dx%dx%d) num_threads=%d\n", name,
+         s.M_outer, s.N_outer, s.K_outer, s.M_tile0, s.N_tile0, s.K_tile0,
+         kernel.num_threads());
+  free(name);
 
   printf("  Checking correctness... ");
   kernel.mmt_func()<<<grid_dim, block_dim, 0, hipStreamDefault>>>(
-      A_device_buffer, B_device_buffer, C_device_buffer, s.M_outer, s.N_outer,
-      s.K_outer);
+      A_device_buffer, B_device_buffer, C_device_buffer, s.N_outer, s.K_outer);
   HIP_CHECK(hipGetLastError());
   HIP_CHECK(hipMemcpy(C_host_data.data(), C_device_buffer, C_bytes,
                       hipMemcpyDeviceToHost));
@@ -204,8 +206,8 @@ void test(const MmtKernel &kernel) {
     HIP_CHECK(hipEventRecord(start, hipStreamDefault));
     for (int b = 0; b < batch_size; ++b) {
       kernel.mmt_func()<<<grid_dim, block_dim, 0, hipStreamDefault>>>(
-          A_device_buffer, B_device_buffer, C_device_buffer, s.M_outer,
-          s.N_outer, s.K_outer);
+          A_device_buffer, B_device_buffer, C_device_buffer, s.N_outer,
+          s.K_outer);
     }
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipEventRecord(stop, hipStreamDefault));
@@ -238,7 +240,6 @@ void test(const MmtKernel &kernel) {
 
 template <int T_M_tile0, int T_N_tile0, int T_K_tile0>
 class MmtKernel_generic : public MmtKernel {
-  virtual const char *name() const override { return "MmtKernel_generic"; }
   virtual int M_tile0() const override { return T_M_tile0; }
   virtual int N_tile0() const override { return T_N_tile0; }
   virtual int K_tile0() const override { return T_K_tile0; }
@@ -254,8 +255,7 @@ class MmtKernel_generic : public MmtKernel {
   virtual int num_threads() const override { return T_M_tile0 * T_N_tile0; }
   virtual mmt_func_t mmt_func() const override { return run; };
   __global__ static void run(const float *A_data, const float *B_data,
-                             float *C_data, int M_outer, int N_outer,
-                             int K_outer) {
+                             float *C_data, int N_outer, int K_outer) {
     int m_outer = blockIdx.x;
     int n_outer = blockIdx.y;
     int m_tile0 = threadIdx.x / T_N_tile0;
@@ -281,9 +281,6 @@ class MmtKernel_generic : public MmtKernel {
 };
 
 class MmtKernel_amdgcn_mfma_f32_16x16x4f32_allrowmajor : public MmtKernel {
-  virtual const char *name() const override {
-    return "MmtKernel_amdgcn_mfma_f32_16x16x4f32_allrowmajor";
-  }
   virtual int M_tile0() const override { return 16; }
   virtual int N_tile0() const override { return 16; }
   virtual int K_tile0() const override { return 4; }
@@ -299,8 +296,7 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_allrowmajor : public MmtKernel {
   virtual int num_threads() const override { return 64; }
   virtual mmt_func_t mmt_func() const override { return run; };
   __global__ static void run(const float *A_data, const float *B_data,
-                             float *C_data, int M_outer, int N_outer,
-                             int K_outer) {
+                             float *C_data, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -326,14 +322,10 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_allrowmajor : public MmtKernel {
       int cj = lane % 16;
       C_data[m_outer * N_outer * 256 + n_outer * 256 + ci * 16 + cj] = acc[gpr];
     }
-    (void)M_outer;
   }
 };
 
 class MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural : public MmtKernel {
-  virtual const char *name() const override {
-    return "MmtKernel_amdgcn_mfma_f32_16x16x4f32_noswizzle";
-  }
   virtual int M_tile0() const override { return 16; }
   virtual int N_tile0() const override { return 16; }
   virtual int K_tile0() const override { return 4; }
@@ -344,13 +336,12 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural : public MmtKernel {
     return [](int n, int k) { return n + 16 * k; };
   }
   virtual tile_layout_func_t C_tile_layout() const override {
-    return [](int m, int n) { return 16 * m + n; };
+    return [](int m, int n) { return 64 * (m / 4) + 4 * n + (m % 4); };
   }
   virtual int num_threads() const override { return 64; }
   virtual mmt_func_t mmt_func() const override { return run; };
   __global__ static void run(const float *A_data, const float *B_data,
-                             float *C_data, int M_outer, int N_outer,
-                             int K_outer) {
+                             float *C_data, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -371,12 +362,9 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural : public MmtKernel {
       B_ptr += 64;
     }
 
-    for (int gpr = 0; gpr < 4; ++gpr) {
-      int ci = 4 * (lane / 16) + gpr;
-      int cj = lane % 16;
-      C_data[m_outer * N_outer * 256 + n_outer * 256 + ci * 16 + cj] = acc[gpr];
-    }
-    (void)M_outer;
+    *reinterpret_cast<floatx4_t *>(C_data +
+                                   256 * (N_outer * m_outer + n_outer) +
+                                   64 * (lane / 16) + 4 * (lane % 16)) = acc;
   }
 };
 

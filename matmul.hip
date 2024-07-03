@@ -75,7 +75,7 @@ std::vector<float> makeRandomFloatVector(int size, std::minstd_rand &r) {
 }
 
 void checkMmtResults(const float *A_data, const float *B_data,
-                       const float *C_data, const TiledMmtShape &s) {
+                     const float *C_data, const TiledMmtShape &s) {
   // This reference code is slow. To make the checks not too slow on
   // large matmuls, we only check at most 16 steps along the major M_outer,
   // N_outer dims.
@@ -190,7 +190,7 @@ void test(const MmtKernel &kernel) {
   HIP_CHECK(hipMemcpy(C_host_data.data(), C_device_buffer, C_bytes,
                       hipMemcpyDeviceToHost));
   checkMmtResults(A_host_data.data(), B_host_data.data(), C_host_data.data(),
-                    s);
+                  s);
   printf("OK\n");
 
   printf("  Benchmarking... ");

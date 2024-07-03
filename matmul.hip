@@ -131,9 +131,9 @@ public:
 };
 
 TiledMmtShape getTestShape(const MmtKernel &kernel) {
-  int M = getIntEnvVar("M", 1024);
-  int N = getIntEnvVar("N", 1024);
-  int K = getIntEnvVar("K", 1024);
+  int M = getIntEnvVar("M", 4096);
+  int N = getIntEnvVar("N", 2048);
+  int K = getIntEnvVar("K", 2048);
   TiledMmtShape s;
   s.M_outer = std::max(1, M / kernel.M_tile0());
   s.N_outer = std::max(1, N / kernel.N_tile0());
@@ -325,7 +325,8 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MmtKernel {
   }
 };
 
-class MmtKernel_amdgcn_mfma_f32_16x16x4f32_naturalAB_rowmajorC : public MmtKernel {
+class MmtKernel_amdgcn_mfma_f32_16x16x4f32_naturalAB_rowmajorC
+    : public MmtKernel {
   virtual int M_tile0() const override { return 16; }
   virtual int N_tile0() const override { return 16; }
   virtual int K_tile0() const override { return 4; }
@@ -399,8 +400,107 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural : public MmtKernel {
       B_ptr += 64;
     }
 
-    *reinterpret_cast<floatx4_t *>(
-        C_data + 256 * (N_outer * m_outer + n_outer) + 4 * lane) = acc;
+    reinterpret_cast<floatx4_t *>(
+        C_data + 256 * (N_outer * m_outer + n_outer))[lane] = acc;
+  }
+};
+
+class MmtKernel_1x2_amdgcn_mfma_f32_16x16x4f32_natural : public MmtKernel {
+  virtual int M_tile0() const override { return 16; }
+  virtual int N_tile0() const override { return 32; }
+  virtual int K_tile0() const override { return 4; }
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) { return 16 * k + m; };
+  }
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) {
+      int ni = n % 16;
+      int no = n / 16;
+      return 64 * no + 16 * k + ni;
+    };
+  }
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) {
+      int ni = n % 16;
+      int no = n / 16;
+      return 256 * no + 64 * (m / 4) + 4 * ni + (m % 4);
+    };
+  }
+  virtual int num_threads() const override { return 128; }
+  virtual mmt_func_t mmt_func() const override { return run; };
+  __global__ static void run(const float *A_data, const float *B_data,
+                             float *C_data, int N_outer, int K_outer) {
+    using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+    floatx4_t acc = {0};
+
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int lane = threadIdx.x;
+
+    const float *A_ptr = A_data + m_outer * K_outer * 64 + (lane % 64);
+    const float *B_ptr = B_data + n_outer * K_outer * 128 + lane;
+
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(*A_ptr, *B_ptr, acc, 0, 0, 0);
+      A_ptr += 64;
+      B_ptr += 128;
+    }
+
+    reinterpret_cast<floatx4_t *>(
+        C_data + 512 * (N_outer * m_outer + n_outer))[lane] = acc;
+  }
+};
+
+class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_natural : public MmtKernel {
+  virtual int M_tile0() const override { return 32; }
+  virtual int N_tile0() const override { return 32; }
+  virtual int K_tile0() const override { return 4; }
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) {
+      int mi = m % 16;
+      int mo = m / 16;
+      return 64 * mo + 16 * k + mi;
+    };
+  }
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) {
+      int ni = n % 16;
+      int no = n / 16;
+      return 64 * no + 16 * k + ni;
+    };
+  }
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) {
+      int mi = m % 16;
+      int mo = m / 16;
+      int ni = n % 16;
+      int no = n / 16;
+      return 512 * mo + 256 * no + 64 * (mi / 4) + 4 * ni + (mi % 4);
+    };
+  }
+  virtual int num_threads() const override { return 256; }
+  virtual mmt_func_t mmt_func() const override { return run; };
+  __global__ static void run(const float *A_data, const float *B_data,
+                             float *C_data, int N_outer, int K_outer) {
+    using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+    floatx4_t acc = {0};
+
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int lane = threadIdx.x;
+
+    const float *A_ptr =
+        A_data + m_outer * K_outer * 128 + (lane % 64) + 64 * (lane / 128);
+    const float *B_ptr = B_data + n_outer * K_outer * 128 + (lane % 128);
+
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(*A_ptr, *B_ptr, acc, 0, 0, 0);
+      A_ptr += 128;
+      B_ptr += 128;
+    }
+
+    reinterpret_cast<floatx4_t *>(
+        C_data + 1024 * (N_outer * m_outer + n_outer))[lane] = acc;
   }
 };
 
@@ -409,4 +509,6 @@ int main() {
   test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_rowmajor());
   test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_naturalAB_rowmajorC());
   test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural());
+  test(MmtKernel_1x2_amdgcn_mfma_f32_16x16x4f32_natural());
+  test(MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_natural());
 }

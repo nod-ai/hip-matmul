@@ -25,82 +25,41 @@ int getIntEnvVar(const char *name, int default_val) {
   return env ? std::stoi(env) : default_val;
 };
 
-struct Matrix8dShape {
-  int rows0, cols0;
-  int rows1, cols1;
-  int rows2, cols2;
-  int rows3, cols3;
+struct TiledMatrixShape {
+  int rows_outer, cols_outer;
+  int rows_tile0, cols_tile0;
 };
 
-struct Mmt8dShape {
-  int M0, N0, K0;
-  int M1, N1, K1;
-  int M2, N2, K2;
-  int M3, N3, K3;
+struct TiledMmtShape {
+  int M_outer, N_outer, K_outer;
+  int M_tile0, N_tile0, K_tile0;
 };
 
-__device__ __host__ Matrix8dShape lhs(const Mmt8dShape &s) {
-  return {s.M0, s.K0, s.M1, s.K1, s.M2, s.K2, s.M3, s.K3};
+__device__ __host__ TiledMatrixShape lhs(const TiledMmtShape &s) {
+  return {s.M_outer, s.K_outer, s.M_tile0, s.K_tile0};
 }
 
-__device__ __host__ Matrix8dShape rhs(const Mmt8dShape &s) {
-  return {s.N0, s.K0, s.N1, s.K1, s.N2, s.K2, s.N3, s.K3};
+__device__ __host__ TiledMatrixShape rhs(const TiledMmtShape &s) {
+  return {s.N_outer, s.K_outer, s.N_tile0, s.K_tile0};
 }
 
-__device__ __host__ Matrix8dShape acc(const Mmt8dShape &s) {
-  return {s.M0, s.N0, s.M1, s.N1, s.M2, s.N2, s.M3, s.N3};
+__device__ __host__ TiledMatrixShape acc(const TiledMmtShape &s) {
+  return {s.M_outer, s.N_outer, s.M_tile0, s.N_tile0};
 }
 
-__device__ __host__ int flatsize(const Matrix8dShape &s) {
-  return s.rows0 * s.cols0 * s.rows1 * s.cols1 * s.rows2 * s.cols2 * s.rows3 *
-         s.cols3;
+__device__ __host__ int flatsize(const TiledMatrixShape &s) {
+  return s.rows_outer * s.cols_outer * s.rows_tile0 * s.cols_tile0;
 }
 
-__device__ __host__ int offset(const Matrix8dShape &s, int r0, int c0, int r1,
-                               int c1, int r2, int c2, int r3, int c3) {
-  return c3 +
-         s.cols3 *
-             (r3 +
-              s.rows3 *
-                  (c2 +
-                   s.cols2 *
-                       (r2 +
-                        s.rows2 *
-                            (c1 +
-                             s.cols1 * (r1 + s.rows1 * (c0 + s.cols0 * r0))))));
+__device__ __host__ int offset(const TiledMatrixShape &s, int r_outer,
+                               int c_outer, int r_tile0, int c_tile0) {
+  return c_tile0 +
+         s.cols_tile0 *
+             (r_tile0 + s.rows_tile0 * (c_outer + s.cols_outer * r_outer));
 }
 
-typedef void (*mmt8d_func_t)(const float *, const float *, float *,
-                             const Mmt8dShape &);
-
-__global__ void mmt8d_generic(const float *A_data, const float *B_data,
-                              float *C_data, const Mmt8dShape &s) {
-  int m0 = blockIdx.x;
-  int n0 = blockIdx.y;
-  int m1m2m3 = threadIdx.x;
-  int n1n2n3 = threadIdx.y;
-  int m1 = m1m2m3 / (s.M2 * s.M3);
-  int n1 = n1n2n3 / (s.N2 * s.N3);
-  int m2 = (m1m2m3 - m1 * s.M2 * s.M3) / s.M3;
-  int n2 = (n1n2n3 - n1 * s.N2 * s.N3) / s.N3;
-  int m3 = m1m2m3 % s.M3;
-  int n3 = n1n2n3 % s.N3;
-
-  float c = 0.f;
-  for (int k0 = 0; k0 < s.K0; ++k0) {
-    for (int k1 = 0; k1 < s.K1; ++k1) {
-      for (int k2 = 0; k2 < s.K2; ++k2) {
-        for (int k3 = 0; k3 < s.K3; ++k3) {
-          float a = A_data[offset(lhs(s), m0, k0, m1, k1, m2, k2, m3, k3)];
-          float b = B_data[offset(rhs(s), n0, k0, n1, k1, n2, k2, n3, k3)];
-          c += a * b;
-        }
-      }
-    }
-  }
-
-  C_data[offset(acc(s), m0, n0, m1, n1, m2, n2, m3, n3)] = c;
-}
+typedef void (*mmt_func_t)(const float *, const float *, float *, int, int,
+                           int);
 
 std::vector<float> makeRandomFloatVector(int size, std::minstd_rand &r) {
   std::vector<float> v(size);
@@ -115,48 +74,37 @@ std::vector<float> makeRandomFloatVector(int size, std::minstd_rand &r) {
 }
 
 void checkMmt8dResults(const float *A_data, const float *B_data,
-                       const float *C_data, const Mmt8dShape &s) {
+                       const float *C_data, const TiledMmtShape &s) {
   // This reference code is slow. To make the checks not too slow on
-  // large matmuls, we only check at most 16 steps along the major M0, N0 dims.
-  int m0_step = std::max(1, s.M0 / 16);
-  int n0_step = std::max(1, s.N0 / 16);
-  for (int m0 = 0; m0 < s.M0; m0 += m0_step) {
-    for (int n0 = 0; n0 < s.N0; n0 += n0_step) {
-      for (int m1 = 0; m1 < s.M1; ++m1) {
-        for (int n1 = 0; n1 < s.N1; ++n1) {
-          for (int m2 = 0; m2 < s.M2; ++m2) {
-            for (int n2 = 0; n2 < s.N2; ++n2) {
-              for (int m3 = 0; m3 < s.M3; ++m3) {
-                for (int n3 = 0; n3 < s.N3; ++n3) {
-                  float c = 0.f;
-                  for (int k0 = 0; k0 < s.K0; ++k0) {
-                    for (int k1 = 0; k1 < s.K1; ++k1) {
-                      for (int k2 = 0; k2 < s.K2; ++k2) {
-                        for (int k3 = 0; k3 < s.K3; ++k3) {
-                          float a = A_data[offset(lhs(s), m0, k0, m1, k1, m2,
-                                                  k2, m3, k3)];
-                          float b = B_data[offset(rhs(s), n0, k0, n1, k1, n2,
-                                                  k2, n3, k3)];
-                          c += a * b;
-                        }
-                      }
-                    }
-                  }
-                  float expected = c;
-                  float actual =
-                      C_data[offset(acc(s), m0, n0, m1, n1, m2, n2, m3, n3)];
-                  if (actual != expected) {
-                    fprintf(stderr,
-                            "matmul numerical error: actual(%g) != "
-                            "expected(%g), at m0=%d n0=%d m1=%d n1=%d m2=%d "
-                            "n2=%d, m3=%d n3=%d, at %s:%d",
-                            actual, expected, m0, n0, m1, n1, m2, n2, m3, n3,
-                            __FILE__, __LINE__);
-                    abort();
-                  }
-                }
-              }
+  // large matmuls, we only check at most 16 steps along the major M_outer,
+  // N_outer dims.
+  int m_outer_step = std::max(1, s.M_outer / 16);
+  int n_outer_step = std::max(1, s.N_outer / 16);
+  for (int m_outer = 0; m_outer < s.M_outer; m_outer += m_outer_step) {
+    for (int n_outer = 0; n_outer < s.N_outer; n_outer += n_outer_step) {
+      for (int m_tile0 = 0; m_tile0 < s.M_tile0; ++m_tile0) {
+        for (int n_tile0 = 0; n_tile0 < s.N_tile0; ++n_tile0) {
+          float c = 0.f;
+          for (int k_outer = 0; k_outer < s.K_outer; ++k_outer) {
+            for (int k_tile0 = 0; k_tile0 < s.K_tile0; ++k_tile0) {
+              float a =
+                  A_data[offset(lhs(s), m_outer, k_outer, m_tile0, k_tile0)];
+              float b =
+                  B_data[offset(rhs(s), n_outer, k_outer, n_tile0, k_tile0)];
+              c += a * b;
             }
+          }
+          float expected = c;
+          float actual =
+              C_data[offset(acc(s), m_outer, n_outer, m_tile0, n_tile0)];
+          if (actual != expected) {
+            fprintf(stderr,
+                    "matmul numerical error: actual(%g) != "
+                    "expected(%g), at m_outer=%d n_outer=%d m_tile0=%d "
+                    "n_tile0=%d, at %s:%d\n",
+                    actual, expected, m_outer, n_outer, m_tile0, n_tile0,
+                    __FILE__, __LINE__);
+            abort();
           }
         }
       }
@@ -164,7 +112,33 @@ void checkMmt8dResults(const float *A_data, const float *B_data,
   }
 }
 
-void test(const char *name, mmt8d_func_t mmt8d_func, const Mmt8dShape &s) {
+class MmtKernel {
+public:
+  virtual ~MmtKernel(){};
+  virtual const char *name() const = 0;
+  virtual int M_tile0() const = 0;
+  virtual int N_tile0() const = 0;
+  virtual int K_tile0() const = 0;
+  virtual int num_threads() const = 0;
+  virtual mmt_func_t mmt_func() const = 0;
+};
+
+TiledMmtShape getTestShape(const MmtKernel &kernel) {
+  int M = getIntEnvVar("M", 1024);
+  int N = getIntEnvVar("N", 1024);
+  int K = getIntEnvVar("K", 1024);
+  TiledMmtShape s;
+  s.M_outer = std::max(1, M / kernel.M_tile0());
+  s.N_outer = std::max(1, N / kernel.N_tile0());
+  s.K_outer = std::max(1, K / kernel.K_tile0());
+  s.M_tile0 = kernel.M_tile0();
+  s.N_tile0 = kernel.N_tile0();
+  s.K_tile0 = kernel.K_tile0();
+  return s;
+}
+
+void test(const MmtKernel &kernel) {
+  TiledMmtShape s = getTestShape(kernel);
   std::minstd_rand random_engine;
   std::vector<float> A_host_data =
       makeRandomFloatVector(flatsize(lhs(s)), random_engine);
@@ -178,7 +152,7 @@ void test(const char *name, mmt8d_func_t mmt8d_func, const Mmt8dShape &s) {
   float *A_device_buffer{};
   float *B_device_buffer{};
   float *C_device_buffer{};
-  Mmt8dShape *shape_device_buffer{};
+  TiledMmtShape *shape_device_buffer{};
   HIP_CHECK(hipMalloc(&A_device_buffer, A_bytes));
   HIP_CHECK(hipMalloc(&B_device_buffer, B_bytes));
   HIP_CHECK(hipMalloc(&C_device_buffer, C_bytes));
@@ -191,22 +165,23 @@ void test(const char *name, mmt8d_func_t mmt8d_func, const Mmt8dShape &s) {
   HIP_CHECK(
       hipMemcpy(shape_device_buffer, &s, sizeof s, hipMemcpyHostToDevice));
 
-  const dim3 grid_dim(s.M0, s.N0);
-  const dim3 block_dim(s.M1 * s.M2 * s.M3, s.M1 * s.M2 * s.M3);
+  const dim3 grid_dim(s.M_outer, s.N_outer);
+  const dim3 block_dim(kernel.num_threads());
 
-  printf("%s: M0=%d, M1=%d, M2=%d, M3=%d, N0=%d, N1=%d, "
-         "N2=%d, N3=%d, K0=%d, K1=%d, K2=%d, K3=%d\n",
-         name, s.M0, s.M1, s.M2, s.M3, s.N0, s.N1, s.N2, s.N3, s.K0, s.K1, s.K2,
-         s.K3);
+  printf("%s: MxNxK outer=(%dx%dx%d) tile0=(%dx%dx%d) num_threads=%d\n",
+         kernel.name(), s.M_outer, s.N_outer, s.K_outer, s.M_tile0, s.N_tile0,
+         s.K_tile0, kernel.num_threads());
 
-  printf("  Checking correctness...\n");
-  mmt8d_func<<<grid_dim, block_dim, 0, hipStreamDefault>>>(
-      A_device_buffer, B_device_buffer, C_device_buffer, *shape_device_buffer);
+  printf("  Checking correctness... ");
+  kernel.mmt_func()<<<grid_dim, block_dim, 0, hipStreamDefault>>>(
+      A_device_buffer, B_device_buffer, C_device_buffer, s.M_outer, s.N_outer,
+      s.K_outer);
   HIP_CHECK(hipGetLastError());
   HIP_CHECK(hipMemcpy(C_host_data.data(), C_device_buffer, C_bytes,
                       hipMemcpyDeviceToHost));
   checkMmt8dResults(A_host_data.data(), B_host_data.data(), C_host_data.data(),
                     s);
+  printf("OK\n");
 
   printf("  Benchmarking... ");
   hipEvent_t start, stop;
@@ -218,9 +193,9 @@ void test(const char *name, mmt8d_func_t mmt8d_func, const Mmt8dShape &s) {
   while (true) {
     HIP_CHECK(hipEventRecord(start, hipStreamDefault));
     for (int b = 0; b < batch_size; ++b) {
-      mmt8d_func<<<grid_dim, block_dim, 0, hipStreamDefault>>>(
-          A_device_buffer, B_device_buffer, C_device_buffer,
-          *shape_device_buffer);
+      kernel.mmt_func()<<<grid_dim, block_dim, 0, hipStreamDefault>>>(
+          A_device_buffer, B_device_buffer, C_device_buffer, s.N_outer,
+          s.N_outer, s.K_outer);
     }
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipEventRecord(stop, hipStreamDefault));
@@ -238,10 +213,10 @@ void test(const char *name, mmt8d_func_t mmt8d_func, const Mmt8dShape &s) {
     }
     batch_size *= 2;
   }
-  float kernel_ops = 2.f * s.M0 * s.M1 * s.M2 * s.M3 * s.N0 * s.N1 * s.N2 *
-                     s.N3 * s.K0 * s.K1 * s.K2 * s.K3;
+  float kernel_ops = 2.f * s.M_outer * s.N_outer * s.K_outer * s.M_tile0 *
+                     s.N_tile0 * s.K_tile0;
   float kernel_ops_per_s = 1000.f * kernel_ops / kernel_ms;
-  printf("    %.3g Tflop/s\n", 1.e-12f * kernel_ops_per_s);
+  printf("%.3g Tflop/s\n", 1.e-12f * kernel_ops_per_s);
 
   HIP_CHECK(hipEventDestroy(start));
   HIP_CHECK(hipEventDestroy(stop));
@@ -251,31 +226,77 @@ void test(const char *name, mmt8d_func_t mmt8d_func, const Mmt8dShape &s) {
   HIP_CHECK(hipFree(shape_device_buffer));
 }
 
-void test(const char *name, mmt8d_func_t mmt8d_func, int M1, int N1, int K1,
-          int M2, int N2, int K2, int M3, int N3, int K3) {
-  int M = getIntEnvVar("M", 1024);
-  int N = getIntEnvVar("N", 1024);
-  int K = getIntEnvVar("K", 1024);
+template <int T_M_tile0, int T_N_tile0, int T_K_tile0>
+class MmtKernelGeneric : public MmtKernel {
+  virtual const char *name() const override { return "MmtKernelGeneric"; }
+  virtual int M_tile0() const override { return T_M_tile0; }
+  virtual int N_tile0() const override { return T_N_tile0; }
+  virtual int K_tile0() const override { return T_K_tile0; }
+  virtual int num_threads() const override { return T_M_tile0 * T_N_tile0; }
+  virtual mmt_func_t mmt_func() const override { return run; };
+  __global__ static void run(const float *A_data, const float *B_data,
+                             float *C_data, int M_outer, int N_outer,
+                             int K_outer) {
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int m_tile0 = threadIdx.x / T_N_tile0;
+    int n_tile0 = threadIdx.x % T_N_tile0;
+    TiledMmtShape s{M_outer, N_outer, K_outer, T_M_tile0, T_N_tile0, T_K_tile0};
+    float c = 0.f;
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      for (int k_tile0 = 0; k_tile0 < T_K_tile0; ++k_tile0) {
+        float a = A_data[offset(lhs(s), m_outer, k_outer, m_tile0, k_tile0)];
+        float b = B_data[offset(rhs(s), n_outer, k_outer, n_tile0, k_tile0)];
+        c += a * b;
+      }
+    }
+    C_data[offset(acc(s), m_outer, n_outer, m_tile0, n_tile0)] = c;
+  }
+};
 
-  Mmt8dShape s;
-  s.M0 = M / (M1 * M2 * M3);
-  s.N0 = N / (N1 * N2 * N3);
-  s.K0 = K / (K1 * K2 * K3);
-  s.M1 = M1;
-  s.N1 = N1;
-  s.K1 = K1;
-  s.M2 = M2;
-  s.N2 = N2;
-  s.K2 = K2;
-  s.M3 = M3;
-  s.N3 = N3;
-  s.K3 = K3;
+#if 0
+struct mmt_mfma_f32_16x16x4f32 {
+  static constexpr int Mblock = 64;
+  static constexpr int Nblock = 1;
+  static constexpr int M_tile0 = 1;
+  static constexpr int N_tile0 = 1;
+  static constexpr int K_tile0 = 4;
+  static constexpr int M2 = 4;
+  static constexpr int N2 = 16;
+  static constexpr int K2 = 1;
+  static constexpr int M3 = 4;
+  static constexpr int N3 = 1;
+  static constexpr int K3 = 1;
+  __global__ static void run(const float *A_data, const float *B_data,
+                             float *C_data, int M_outer, int N_outer,
+                             int K_outer) {
+    using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+    floatx4_t c = {0};
 
-  test(name, mmt8d_func, s);
-}
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int t = threadIdx.x;
 
-#define TEST(kernel, ...) test(#kernel, kernel, __VA_ARGS__)
+    int k_tile0 = t / 16;
+    int m2 = (t % 16) / 4;
+    int m3 = t % 4;
+    int n2 = t % 16;
 
-int main() {
-  TEST(mmt8d_generic, /*M1=*/16, /*N1=*/16, /*K1=*/1, 1, 1, 1, 1, 1, 1);
-}
+    const float *A_ptr = A_data + 16 * k_tile0 + 4 * m2;
+    const float *B_ptr = B_data + t;
+
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      c = __builtin_amdgcn_mfma_f32_16x16x4f32(*A_ptr, *B_ptr, c, 0, 0, 0);
+      A_ptr += 64;
+      B_ptr += 64;
+    }
+
+    for (int m3 = 0; m3 < 4; ++m3) {
+      C_data[64 * m2 + 4 * n2 + m3] = c[m3];
+    }
+    (void)M_outer;
+  }
+};
+#endif
+
+int main() { test(MmtKernelGeneric<3, 5, 2>()); }

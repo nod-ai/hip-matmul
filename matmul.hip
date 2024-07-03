@@ -6,6 +6,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <functional>
 #include <random>
 #include <vector>
 
@@ -25,26 +26,30 @@ int getIntEnvVar(const char *name, int default_val) {
   return env ? std::stoi(env) : default_val;
 };
 
+typedef int (*tile_layout_func_t)(int, int);
+
 struct TiledMatrixShape {
   int rows_outer, cols_outer;
   int rows_tile0, cols_tile0;
+  tile_layout_func_t tile_layout;
 };
 
 struct TiledMmtShape {
   int M_outer, N_outer, K_outer;
   int M_tile0, N_tile0, K_tile0;
+  tile_layout_func_t A_tile_layout, B_tile_layout, C_tile_layout;
 };
 
-__device__ __host__ TiledMatrixShape lhs(const TiledMmtShape &s) {
-  return {s.M_outer, s.K_outer, s.M_tile0, s.K_tile0};
+__device__ __host__ TiledMatrixShape A_shape(const TiledMmtShape &s) {
+  return {s.M_outer, s.K_outer, s.M_tile0, s.K_tile0, s.A_tile_layout};
 }
 
-__device__ __host__ TiledMatrixShape rhs(const TiledMmtShape &s) {
-  return {s.N_outer, s.K_outer, s.N_tile0, s.K_tile0};
+__device__ __host__ TiledMatrixShape B_shape(const TiledMmtShape &s) {
+  return {s.N_outer, s.K_outer, s.N_tile0, s.K_tile0, s.B_tile_layout};
 }
 
-__device__ __host__ TiledMatrixShape acc(const TiledMmtShape &s) {
-  return {s.M_outer, s.N_outer, s.M_tile0, s.N_tile0};
+__device__ __host__ TiledMatrixShape C_shape(const TiledMmtShape &s) {
+  return {s.M_outer, s.N_outer, s.M_tile0, s.N_tile0, s.C_tile_layout};
 }
 
 __device__ __host__ int flatsize(const TiledMatrixShape &s) {
@@ -53,13 +58,9 @@ __device__ __host__ int flatsize(const TiledMatrixShape &s) {
 
 __device__ __host__ int offset(const TiledMatrixShape &s, int r_outer,
                                int c_outer, int r_tile0, int c_tile0) {
-  return c_tile0 +
-         s.cols_tile0 *
-             (r_tile0 + s.rows_tile0 * (c_outer + s.cols_outer * r_outer));
+  return s.tile_layout(r_tile0, c_tile0) +
+         s.rows_tile0 * s.cols_tile0 * (c_outer + s.cols_outer * r_outer);
 }
-
-typedef void (*mmt_func_t)(const float *, const float *, float *, int, int,
-                           int);
 
 std::vector<float> makeRandomFloatVector(int size, std::minstd_rand &r) {
   std::vector<float> v(size);
@@ -87,16 +88,16 @@ void checkMmt8dResults(const float *A_data, const float *B_data,
           float c = 0.f;
           for (int k_outer = 0; k_outer < s.K_outer; ++k_outer) {
             for (int k_tile0 = 0; k_tile0 < s.K_tile0; ++k_tile0) {
-              float a =
-                  A_data[offset(lhs(s), m_outer, k_outer, m_tile0, k_tile0)];
-              float b =
-                  B_data[offset(rhs(s), n_outer, k_outer, n_tile0, k_tile0)];
+              float a = A_data[offset(A_shape(s), m_outer, k_outer, m_tile0,
+                                      k_tile0)];
+              float b = B_data[offset(B_shape(s), n_outer, k_outer, n_tile0,
+                                      k_tile0)];
               c += a * b;
             }
           }
           float expected = c;
           float actual =
-              C_data[offset(acc(s), m_outer, n_outer, m_tile0, n_tile0)];
+              C_data[offset(C_shape(s), m_outer, n_outer, m_tile0, n_tile0)];
           if (actual != expected) {
             fprintf(stderr,
                     "matmul numerical error: actual(%g) != "
@@ -112,6 +113,9 @@ void checkMmt8dResults(const float *A_data, const float *B_data,
   }
 }
 
+typedef void (*mmt_func_t)(const float *, const float *, float *, int, int,
+                           int);
+
 class MmtKernel {
 public:
   virtual ~MmtKernel(){};
@@ -119,6 +123,9 @@ public:
   virtual int M_tile0() const = 0;
   virtual int N_tile0() const = 0;
   virtual int K_tile0() const = 0;
+  virtual tile_layout_func_t A_tile_layout() const = 0;
+  virtual tile_layout_func_t B_tile_layout() const = 0;
+  virtual tile_layout_func_t C_tile_layout() const = 0;
   virtual int num_threads() const = 0;
   virtual mmt_func_t mmt_func() const = 0;
 };
@@ -134,6 +141,9 @@ TiledMmtShape getTestShape(const MmtKernel &kernel) {
   s.M_tile0 = kernel.M_tile0();
   s.N_tile0 = kernel.N_tile0();
   s.K_tile0 = kernel.K_tile0();
+  s.A_tile_layout = kernel.A_tile_layout();
+  s.B_tile_layout = kernel.B_tile_layout();
+  s.C_tile_layout = kernel.C_tile_layout();
   return s;
 }
 
@@ -141,10 +151,10 @@ void test(const MmtKernel &kernel) {
   TiledMmtShape s = getTestShape(kernel);
   std::minstd_rand random_engine;
   std::vector<float> A_host_data =
-      makeRandomFloatVector(flatsize(lhs(s)), random_engine);
+      makeRandomFloatVector(flatsize(A_shape(s)), random_engine);
   std::vector<float> B_host_data =
-      makeRandomFloatVector(flatsize(rhs(s)), random_engine);
-  std::vector<float> C_host_data(flatsize(acc(s)));
+      makeRandomFloatVector(flatsize(B_shape(s)), random_engine);
+  std::vector<float> C_host_data(flatsize(C_shape(s)));
 
   const size_t A_bytes = sizeof(float) * A_host_data.size();
   const size_t B_bytes = sizeof(float) * B_host_data.size();
@@ -194,7 +204,7 @@ void test(const MmtKernel &kernel) {
     HIP_CHECK(hipEventRecord(start, hipStreamDefault));
     for (int b = 0; b < batch_size; ++b) {
       kernel.mmt_func()<<<grid_dim, block_dim, 0, hipStreamDefault>>>(
-          A_device_buffer, B_device_buffer, C_device_buffer, s.N_outer,
+          A_device_buffer, B_device_buffer, C_device_buffer, s.M_outer,
           s.N_outer, s.K_outer);
     }
     HIP_CHECK(hipGetLastError());
@@ -232,6 +242,15 @@ class MmtKernelGeneric : public MmtKernel {
   virtual int M_tile0() const override { return T_M_tile0; }
   virtual int N_tile0() const override { return T_N_tile0; }
   virtual int K_tile0() const override { return T_K_tile0; }
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) { return k + T_K_tile0 * m; };
+  }
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) { return k + T_K_tile0 * n; };
+  }
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) { return n + T_N_tile0 * m; };
+  }
   virtual int num_threads() const override { return T_M_tile0 * T_N_tile0; }
   virtual mmt_func_t mmt_func() const override { return run; };
   __global__ static void run(const float *A_data, const float *B_data,
@@ -241,16 +260,23 @@ class MmtKernelGeneric : public MmtKernel {
     int n_outer = blockIdx.y;
     int m_tile0 = threadIdx.x / T_N_tile0;
     int n_tile0 = threadIdx.x % T_N_tile0;
-    TiledMmtShape s{M_outer, N_outer, K_outer, T_M_tile0, T_N_tile0, T_K_tile0};
     float c = 0.f;
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       for (int k_tile0 = 0; k_tile0 < T_K_tile0; ++k_tile0) {
-        float a = A_data[offset(lhs(s), m_outer, k_outer, m_tile0, k_tile0)];
-        float b = B_data[offset(rhs(s), n_outer, k_outer, n_tile0, k_tile0)];
+        float a =
+            A_data[k_tile0 +
+                   T_K_tile0 *
+                       (m_tile0 + T_M_tile0 * (k_outer + K_outer * m_outer))];
+        float b =
+            B_data[k_tile0 +
+                   T_K_tile0 *
+                       (n_tile0 + T_N_tile0 * (k_outer + K_outer * n_outer))];
         c += a * b;
       }
     }
-    C_data[offset(acc(s), m_outer, n_outer, m_tile0, n_tile0)] = c;
+    C_data[n_tile0 +
+           T_N_tile0 * (m_tile0 + T_M_tile0 * (n_outer + N_outer * m_outer))] =
+        c;
   }
 };
 

@@ -1,8 +1,8 @@
 # Toying with matmuls in HIP
 
-Just a learning doodle. Might grow into a self-contained testbed to study matmul kernels.
+Trying to put together a self-contained testbed for data-tiled matmul kernels
+using MFMA intrinsics.
 
 ```
 hipcc matmul.hip -o /tmp/matmul && /tmp/matmul
 ```
-

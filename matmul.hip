@@ -280,7 +280,7 @@ class MmtKernel_generic : public MmtKernel {
   }
 };
 
-class MmtKernel_amdgcn_mfma_f32_16x16x4f32_allrowmajor : public MmtKernel {
+class MmtKernel_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MmtKernel {
   virtual int M_tile0() const override { return 16; }
   virtual int N_tile0() const override { return 16; }
   virtual int K_tile0() const override { return 4; }
@@ -325,7 +325,7 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_allrowmajor : public MmtKernel {
   }
 };
 
-class MmtKernel_amdgcn_mfma_f32_16x16x4f32_naturalAB : public MmtKernel {
+class MmtKernel_amdgcn_mfma_f32_16x16x4f32_naturalAB_rowmajorC : public MmtKernel {
   virtual int M_tile0() const override { return 16; }
   virtual int N_tile0() const override { return 16; }
   virtual int K_tile0() const override { return 4; }
@@ -348,10 +348,6 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_naturalAB : public MmtKernel {
     int m_outer = blockIdx.x;
     int n_outer = blockIdx.y;
     int lane = threadIdx.x;
-    int ai = lane % 16;
-    int ak = lane / 16;
-    int bj = lane % 16;
-    int bk = lane / 16;
 
     const float *A_ptr = A_data + m_outer * K_outer * 64 + lane;
     const float *B_ptr = B_data + n_outer * K_outer * 64 + lane;
@@ -370,7 +366,7 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_naturalAB : public MmtKernel {
   }
 };
 
-class MmtKernel_amdgcn_mfma_f32_16x16x4f32_naturalABC : public MmtKernel {
+class MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural : public MmtKernel {
   virtual int M_tile0() const override { return 16; }
   virtual int N_tile0() const override { return 16; }
   virtual int K_tile0() const override { return 4; }
@@ -393,10 +389,6 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_naturalABC : public MmtKernel {
     int m_outer = blockIdx.x;
     int n_outer = blockIdx.y;
     int lane = threadIdx.x;
-    int ai = lane % 16;
-    int ak = lane / 16;
-    int bj = lane % 16;
-    int bk = lane / 16;
 
     const float *A_ptr = A_data + m_outer * K_outer * 64 + lane;
     const float *B_ptr = B_data + n_outer * K_outer * 64 + lane;
@@ -414,7 +406,7 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_naturalABC : public MmtKernel {
 
 int main() {
   test(MmtKernel_generic<3, 5, 2>());
-  test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_allrowmajor());
-  test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_naturalAB());
-  test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_naturalABC());
+  test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_rowmajor());
+  test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_naturalAB_rowmajorC());
+  test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural());
 }

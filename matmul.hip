@@ -74,7 +74,7 @@ std::vector<float> makeRandomFloatVector(int size, std::minstd_rand &r) {
   return v;
 }
 
-void checkMmt8dResults(const float *A_data, const float *B_data,
+void checkMmtResults(const float *A_data, const float *B_data,
                        const float *C_data, const TiledMmtShape &s) {
   // This reference code is slow. To make the checks not too slow on
   // large matmuls, we only check at most 16 steps along the major M_outer,
@@ -189,7 +189,7 @@ void test(const MmtKernel &kernel) {
   HIP_CHECK(hipGetLastError());
   HIP_CHECK(hipMemcpy(C_host_data.data(), C_device_buffer, C_bytes,
                       hipMemcpyDeviceToHost));
-  checkMmt8dResults(A_host_data.data(), B_host_data.data(), C_host_data.data(),
+  checkMmtResults(A_host_data.data(), B_host_data.data(), C_host_data.data(),
                     s);
   printf("OK\n");
 
@@ -330,7 +330,58 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_allrowmajor : public MmtKernel {
   }
 };
 
+class MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural : public MmtKernel {
+  virtual const char *name() const override {
+    return "MmtKernel_amdgcn_mfma_f32_16x16x4f32_noswizzle";
+  }
+  virtual int M_tile0() const override { return 16; }
+  virtual int N_tile0() const override { return 16; }
+  virtual int K_tile0() const override { return 4; }
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) { return m + 16 * k; };
+  }
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) { return n + 16 * k; };
+  }
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) { return 16 * m + n; };
+  }
+  virtual int num_threads() const override { return 64; }
+  virtual mmt_func_t mmt_func() const override { return run; };
+  __global__ static void run(const float *A_data, const float *B_data,
+                             float *C_data, int M_outer, int N_outer,
+                             int K_outer) {
+    using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+    floatx4_t acc = {0};
+
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int lane = threadIdx.x;
+    int ai = lane % 16;
+    int ak = lane / 16;
+    int bj = lane % 16;
+    int bk = lane / 16;
+
+    const float *A_ptr = A_data + m_outer * K_outer * 64 + lane;
+    const float *B_ptr = B_data + n_outer * K_outer * 64 + lane;
+
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(*A_ptr, *B_ptr, acc, 0, 0, 0);
+      A_ptr += 64;
+      B_ptr += 64;
+    }
+
+    for (int gpr = 0; gpr < 4; ++gpr) {
+      int ci = 4 * (lane / 16) + gpr;
+      int cj = lane % 16;
+      C_data[m_outer * N_outer * 256 + n_outer * 256 + ci * 16 + cj] = acc[gpr];
+    }
+    (void)M_outer;
+  }
+};
+
 int main() {
   test(MmtKernel_generic<3, 5, 2>());
   test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_allrowmajor());
+  test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural());
 }

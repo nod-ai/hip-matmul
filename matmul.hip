@@ -302,11 +302,11 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MmtKernel {
 
     int m_outer = blockIdx.x;
     int n_outer = blockIdx.y;
-    int lane = threadIdx.x;
-    int ai = lane % 16;
-    int ak = lane / 16;
-    int bj = lane % 16;
-    int bk = lane / 16;
+    int tid = threadIdx.x;
+    int ai = tid % 16;
+    int ak = tid / 16;
+    int bj = tid % 16;
+    int bk = tid / 16;
 
     const float *A_ptr = A_data + m_outer * K_outer * 64 + ai * 4 + ak;
     const float *B_ptr = B_data + n_outer * K_outer * 64 + bk * 16 + bj;
@@ -318,8 +318,8 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MmtKernel {
     }
 
     for (int gpr = 0; gpr < 4; ++gpr) {
-      int ci = 4 * (lane / 16) + gpr;
-      int cj = lane % 16;
+      int ci = 4 * (tid / 16) + gpr;
+      int cj = tid % 16;
       C_data[m_outer * N_outer * 256 + n_outer * 256 + ci * 16 + cj] = acc[gpr];
     }
   }
@@ -348,10 +348,10 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_naturalAB_rowmajorC
 
     int m_outer = blockIdx.x;
     int n_outer = blockIdx.y;
-    int lane = threadIdx.x;
+    int tid = threadIdx.x;
 
-    const float *A_ptr = A_data + m_outer * K_outer * 64 + lane;
-    const float *B_ptr = B_data + n_outer * K_outer * 64 + lane;
+    const float *A_ptr = A_data + m_outer * K_outer * 64 + tid;
+    const float *B_ptr = B_data + n_outer * K_outer * 64 + tid;
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       acc = __builtin_amdgcn_mfma_f32_16x16x4f32(*A_ptr, *B_ptr, acc, 0, 0, 0);
@@ -360,8 +360,8 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_naturalAB_rowmajorC
     }
 
     for (int gpr = 0; gpr < 4; ++gpr) {
-      int ci = 4 * (lane / 16) + gpr;
-      int cj = lane % 16;
+      int ci = 4 * (tid / 16) + gpr;
+      int cj = tid % 16;
       C_data[m_outer * N_outer * 256 + n_outer * 256 + ci * 16 + cj] = acc[gpr];
     }
   }
@@ -389,10 +389,10 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural : public MmtKernel {
 
     int m_outer = blockIdx.x;
     int n_outer = blockIdx.y;
-    int lane = threadIdx.x;
+    int tid = threadIdx.x;
 
-    const float *A_ptr = A_data + m_outer * K_outer * 64 + lane;
-    const float *B_ptr = B_data + n_outer * K_outer * 64 + lane;
+    const float *A_ptr = A_data + m_outer * K_outer * 64 + tid;
+    const float *B_ptr = B_data + n_outer * K_outer * 64 + tid;
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       acc = __builtin_amdgcn_mfma_f32_16x16x4f32(*A_ptr, *B_ptr, acc, 0, 0, 0);
@@ -401,7 +401,52 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural : public MmtKernel {
     }
 
     reinterpret_cast<floatx4_t *>(
-        C_data + 256 * (N_outer * m_outer + n_outer))[lane] = acc;
+        C_data + 256 * (N_outer * m_outer + n_outer))[tid] = acc;
+  }
+};
+
+class MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural_Kx4 : public MmtKernel {
+  virtual int M_tile0() const override { return 16; }
+  virtual int N_tile0() const override { return 16; }
+  virtual int K_tile0() const override { return 16; }
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) { return (k / 4) + 4 * (m + 16 * (k % 4)); };
+  }
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) { return (k / 4) + 4 * (n + 16 * (k % 4)); };
+  }
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) { return 64 * (m / 4) + 4 * n + (m % 4); };
+  }
+  virtual int num_threads() const override { return 64; }
+  virtual mmt_func_t mmt_func() const override { return run; };
+  __global__ static void run(const float *A_data, const float *B_data,
+                             float *C_data, int N_outer, int K_outer) {
+    using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+    floatx4_t acc = {0};
+
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int tid = threadIdx.x;
+
+    const float *A_ptr = A_data + m_outer * K_outer * 256 + 4 * tid;
+    const float *B_ptr = B_data + n_outer * K_outer * 256 + 4 * tid;
+
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(A_ptr[0], B_ptr[0], acc, 0, 0,
+                                                 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(A_ptr[1], B_ptr[1], acc, 0, 0,
+                                                 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(A_ptr[2], B_ptr[2], acc, 0, 0,
+                                                 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(A_ptr[3], B_ptr[3], acc, 0, 0,
+                                                 0);
+      A_ptr += 256;
+      B_ptr += 256;
+    }
+
+    reinterpret_cast<floatx4_t *>(
+        C_data + 256 * (N_outer * m_outer + n_outer))[tid] = acc;
   }
 };
 
@@ -435,10 +480,10 @@ class MmtKernel_1x2_amdgcn_mfma_f32_16x16x4f32_natural : public MmtKernel {
 
     int m_outer = blockIdx.x;
     int n_outer = blockIdx.y;
-    int lane = threadIdx.x;
+    int tid = threadIdx.x;
 
-    const float *A_ptr = A_data + m_outer * K_outer * 64 + (lane % 64);
-    const float *B_ptr = B_data + n_outer * K_outer * 128 + lane;
+    const float *A_ptr = A_data + m_outer * K_outer * 64 + (tid % 64);
+    const float *B_ptr = B_data + n_outer * K_outer * 128 + tid;
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       acc = __builtin_amdgcn_mfma_f32_16x16x4f32(*A_ptr, *B_ptr, acc, 0, 0, 0);
@@ -447,7 +492,7 @@ class MmtKernel_1x2_amdgcn_mfma_f32_16x16x4f32_natural : public MmtKernel {
     }
 
     reinterpret_cast<floatx4_t *>(
-        C_data + 512 * (N_outer * m_outer + n_outer))[lane] = acc;
+        C_data + 512 * (N_outer * m_outer + n_outer))[tid] = acc;
   }
 };
 
@@ -487,11 +532,11 @@ class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_natural : public MmtKernel {
 
     int m_outer = blockIdx.x;
     int n_outer = blockIdx.y;
-    int lane = threadIdx.x;
+    int tid = threadIdx.x;
 
     const float *A_ptr =
-        A_data + m_outer * K_outer * 128 + (lane % 64) + 64 * (lane / 128);
-    const float *B_ptr = B_data + n_outer * K_outer * 128 + (lane % 128);
+        A_data + m_outer * K_outer * 128 + (tid % 64) + 64 * (tid / 128);
+    const float *B_ptr = B_data + n_outer * K_outer * 128 + (tid % 128);
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       acc = __builtin_amdgcn_mfma_f32_16x16x4f32(*A_ptr, *B_ptr, acc, 0, 0, 0);
@@ -500,7 +545,7 @@ class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_natural : public MmtKernel {
     }
 
     reinterpret_cast<floatx4_t *>(
-        C_data + 1024 * (N_outer * m_outer + n_outer))[lane] = acc;
+        C_data + 1024 * (N_outer * m_outer + n_outer))[tid] = acc;
   }
 };
 
@@ -509,6 +554,7 @@ int main() {
   test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_rowmajor());
   test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_naturalAB_rowmajorC());
   test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural());
+  test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural_Kx4());
   test(MmtKernel_1x2_amdgcn_mfma_f32_16x16x4f32_natural());
   test(MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_natural());
 }

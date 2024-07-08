@@ -450,6 +450,81 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural_Kx4 : public MmtKernel {
   }
 };
 
+class MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural_Kx4_unrollx4
+    : public MmtKernel {
+  virtual int M_tile0() const override { return 16; }
+  virtual int N_tile0() const override { return 16; }
+  virtual int K_tile0() const override { return 16; }
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) { return (k / 4) + 4 * (m + 16 * (k % 4)); };
+  }
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) { return (k / 4) + 4 * (n + 16 * (k % 4)); };
+  }
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) { return 64 * (m / 4) + 4 * n + (m % 4); };
+  }
+  virtual int num_threads() const override { return 64; }
+  virtual mmt_func_t mmt_func() const override { return run; };
+  __global__ static void run(const float *A_data, const float *B_data,
+                             float *C_data, int N_outer, int K_outer) {
+    using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+    floatx4_t acc = {0};
+
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int tid = threadIdx.x;
+
+    const floatx4_t *A_ptr = reinterpret_cast<const floatx4_t *>(A_data) +
+                             m_outer * K_outer * 64 + tid;
+    const floatx4_t *B_ptr = reinterpret_cast<const floatx4_t *>(B_data) +
+                             n_outer * K_outer * 64 + tid;
+
+    int k_outer = 0;
+    for (; k_outer <= K_outer - 4; k_outer += 4) {
+      floatx4_t a0 = A_ptr[0];
+      floatx4_t a1 = A_ptr[64];
+      floatx4_t a2 = A_ptr[128];
+      floatx4_t a3 = A_ptr[192];
+      floatx4_t b0 = B_ptr[0];
+      floatx4_t b1 = B_ptr[64];
+      floatx4_t b2 = B_ptr[128];
+      floatx4_t b3 = B_ptr[192];
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a0[0], b0[0], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a0[1], b0[1], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a0[2], b0[2], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a0[3], b0[3], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a1[0], b1[0], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a1[1], b1[1], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a1[2], b1[2], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a1[3], b1[3], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a2[0], b2[0], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a2[1], b2[1], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a2[2], b2[2], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a2[3], b2[3], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a3[0], b3[0], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a3[1], b3[1], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a3[2], b3[2], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a3[3], b3[3], acc, 0, 0, 0);
+      A_ptr += 256;
+      B_ptr += 256;
+    }
+    for (; k_outer < K_outer; ++k_outer) {
+      floatx4_t a0 = A_ptr[0];
+      floatx4_t b0 = B_ptr[0];
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a0[0], b0[0], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a0[1], b0[1], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a0[2], b0[2], acc, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a0[3], b0[3], acc, 0, 0, 0);
+      A_ptr += 64;
+      B_ptr += 64;
+    }
+
+    reinterpret_cast<floatx4_t *>(
+        C_data + 256 * (N_outer * m_outer + n_outer))[tid] = acc;
+  }
+};
+
 class MmtKernel_1x2_amdgcn_mfma_f32_16x16x4f32_natural : public MmtKernel {
   virtual int M_tile0() const override { return 16; }
   virtual int N_tile0() const override { return 32; }
@@ -555,6 +630,7 @@ int main() {
   test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_naturalAB_rowmajorC());
   test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural());
   test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural_Kx4());
+  test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural_Kx4_unrollx4());
   test(MmtKernel_1x2_amdgcn_mfma_f32_16x16x4f32_natural());
   test(MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_natural());
 }

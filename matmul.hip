@@ -148,6 +148,12 @@ TiledMmtShape getTestShape(const MmtKernel &kernel) {
 }
 
 void test(const MmtKernel &kernel) {
+  char *name =
+      abi::__cxa_demangle(typeid(kernel).name(), nullptr, nullptr, nullptr);
+  const char* filter = getenv("FILTER");
+  if (filter && !strstr(name, filter)) {
+    return;
+  }
   TiledMmtShape s = getTestShape(kernel);
   std::minstd_rand random_engine;
   std::vector<float> A_host_data =
@@ -178,28 +184,28 @@ void test(const MmtKernel &kernel) {
   const dim3 grid_dim(s.M_outer, s.N_outer);
   const dim3 block_dim(kernel.num_threads());
 
-  char *name =
-      abi::__cxa_demangle(typeid(kernel).name(), nullptr, nullptr, nullptr);
   printf("%s: MxNxK outer=(%dx%dx%d) tile0=(%dx%dx%d) num_threads=%d\n", name,
          s.M_outer, s.N_outer, s.K_outer, s.M_tile0, s.N_tile0, s.K_tile0,
          kernel.num_threads());
   free(name);
 
-  printf("  Checking correctness... ");
-  kernel.mmt_func()<<<grid_dim, block_dim, 0, hipStreamDefault>>>(
-      A_device_buffer, B_device_buffer, C_device_buffer, s.N_outer, s.K_outer);
-  HIP_CHECK(hipGetLastError());
-  HIP_CHECK(hipMemcpy(C_host_data.data(), C_device_buffer, C_bytes,
-                      hipMemcpyDeviceToHost));
-  checkMmtResults(A_host_data.data(), B_host_data.data(), C_host_data.data(),
-                  s);
-  printf("OK\n");
+  if (!getIntEnvVar("SKIP_CHECK", 0)) {
+    printf("  Checking correctness... ");
+    kernel.mmt_func()<<<grid_dim, block_dim, 0, hipStreamDefault>>>(
+        A_device_buffer, B_device_buffer, C_device_buffer, s.N_outer, s.K_outer);
+    HIP_CHECK(hipGetLastError());
+    HIP_CHECK(hipMemcpy(C_host_data.data(), C_device_buffer, C_bytes,
+                        hipMemcpyDeviceToHost));
+    checkMmtResults(A_host_data.data(), B_host_data.data(), C_host_data.data(),
+                    s);
+    printf("OK\n");
+  }
 
   printf("  Benchmarking... ");
   hipEvent_t start, stop;
   HIP_CHECK(hipEventCreate(&start));
   HIP_CHECK(hipEventCreate(&stop));
-  float kernel_ms{};
+  float batch_ms{};
   float min_batch_ms = getIntEnvVar("BENCHMARK_MIN_MS", 100);
   int batch_size = 1;
   while (true) {
@@ -212,10 +218,8 @@ void test(const MmtKernel &kernel) {
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipEventRecord(stop, hipStreamDefault));
     HIP_CHECK(hipEventSynchronize(stop));
-    float batch_ms{};
     HIP_CHECK(hipEventElapsedTime(&batch_ms, start, stop));
     if (batch_ms >= min_batch_ms) {
-      kernel_ms = batch_ms / batch_size;
       break;
     }
     if (batch_size > (1 << 20)) {
@@ -225,10 +229,13 @@ void test(const MmtKernel &kernel) {
     }
     batch_size *= 2;
   }
+  float kernel_ms = batch_ms / batch_size;
   float kernel_ops = 2.f * s.M_outer * s.N_outer * s.K_outer * s.M_tile0 *
                      s.N_tile0 * s.K_tile0;
+  float kernel_bytes_read = static_cast<float>(sizeof(float)) * s.M_outer * s.N_outer * s.K_outer * (s.M_tile0 + s.N_tile0) * s.K_tile0;
   float kernel_ops_per_s = 1000.f * kernel_ops / kernel_ms;
-  printf("%.3g Tflop/s\n", 1.e-12f * kernel_ops_per_s);
+  float kernel_bytes_read_per_s =  1000.f * kernel_bytes_read / kernel_ms;
+  printf("%.3g Tflop/s, read %.3g TB/s\n", 1.e-12f * kernel_ops_per_s, 1e-12f * kernel_bytes_read_per_s);
 
   HIP_CHECK(hipEventDestroy(start));
   HIP_CHECK(hipEventDestroy(stop));
@@ -483,12 +490,12 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_natural_Kx4_unrollx4
     int k_outer = 0;
     for (; k_outer <= K_outer - 4; k_outer += 4) {
       floatx4_t a0 = A_ptr[0];
-      floatx4_t a1 = A_ptr[64];
-      floatx4_t a2 = A_ptr[128];
-      floatx4_t a3 = A_ptr[192];
       floatx4_t b0 = B_ptr[0];
+      floatx4_t a1 = A_ptr[64];
       floatx4_t b1 = B_ptr[64];
+      floatx4_t a2 = A_ptr[128];
       floatx4_t b2 = B_ptr[128];
+      floatx4_t a3 = A_ptr[192];
       floatx4_t b3 = B_ptr[192];
       acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a0[0], b0[0], acc, 0, 0, 0);
       acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a0[1], b0[1], acc, 0, 0, 0);

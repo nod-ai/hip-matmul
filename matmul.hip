@@ -679,7 +679,7 @@ class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
     const float *A_global = A_data + m_outer * K_outer * A_tile_size;
     const float *B_global = B_data + n_outer * K_outer * B_tile_size;
 
-    constexpr int K_outer_shared_size = 64;
+    constexpr int K_outer_shared_size = 4; // Tuned.
 
     __shared__ float A_shared[K_outer_shared_size * A_tile_size];
     __shared__ float B_shared[K_outer_shared_size * B_tile_size];
@@ -806,7 +806,7 @@ class MmtKernel_4x4_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
     const float *A_global = A_data + m_outer * K_outer * A_tile_size;
     const float *B_global = B_data + n_outer * K_outer * B_tile_size;
 
-    constexpr int K_outer_shared_size = 32;
+    constexpr int K_outer_shared_size = 4; // Tuned.
 
     __shared__ float A_shared[K_outer_shared_size * A_tile_size];
     __shared__ float B_shared[K_outer_shared_size * B_tile_size];
@@ -902,6 +902,222 @@ class MmtKernel_4x4_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
   }
 };
 
+class MmtKernel_8x8_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
+  virtual int M_tile0() const override { return 128; }
+  virtual int N_tile0() const override { return 128; }
+  virtual int K_tile0() const override { return 4; }
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) {
+      int mi = m % 16;
+      int mo = m / 16;
+      return 64 * mo + 16 * k + mi;
+    };
+  }
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) {
+      int ni = n % 16;
+      int no = n / 16;
+      return 64 * no + 16 * k + ni;
+    };
+  }
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) {
+      int mi = m % 16;
+      int mo = m / 16;
+      int ni = n % 16;
+      int no = n / 16;
+      return 2048 * mo + 256 * no + 64 * (mi / 4) + 4 * ni + (mi % 4);
+    };
+  }
+  virtual int num_threads() const override { return 256; }
+  virtual mmt_func_t mmt_func() const override { return run; };
+  __global__ static void run(const float *A_data, const float *B_data,
+                             float *C_data, int N_outer, int K_outer) {
+    using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+    floatx4_t acc00 = {0};
+    floatx4_t acc01 = {0};
+    floatx4_t acc10 = {0};
+    floatx4_t acc11 = {0};
+    floatx4_t acc20 = {0};
+    floatx4_t acc21 = {0};
+    floatx4_t acc30 = {0};
+    floatx4_t acc31 = {0};
+    floatx4_t acc40 = {0};
+    floatx4_t acc41 = {0};
+    floatx4_t acc50 = {0};
+    floatx4_t acc51 = {0};
+    floatx4_t acc60 = {0};
+    floatx4_t acc61 = {0};
+    floatx4_t acc70 = {0};
+    floatx4_t acc71 = {0};
+
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int tid = threadIdx.x;
+
+    constexpr int A_tile_size = 128 * 4;
+    constexpr int B_tile_size = 128 * 4;
+
+    const float *A_global = A_data + m_outer * K_outer * A_tile_size;
+    const float *B_global = B_data + n_outer * K_outer * B_tile_size;
+
+    constexpr int K_outer_shared_size = 4; // Tuned.
+
+    __shared__ float A_shared[K_outer_shared_size * A_tile_size];
+    __shared__ float B_shared[K_outer_shared_size * B_tile_size];
+
+    const float *A_global_ptr = A_global + tid;
+    const float *B_global_ptr = B_global + tid;
+
+    // Main loop: handle full-size shared tiles.
+    int k_outer_global = 0;
+    for (; k_outer_global <= K_outer - K_outer_shared_size;
+         k_outer_global += K_outer_shared_size) {
+      {
+        float *A_shared_ptr = A_shared + tid;
+        float *B_shared_ptr = B_shared + tid;
+        for (int k_outer_shared = 0; k_outer_shared < K_outer_shared_size;
+             ++k_outer_shared) {
+          A_shared_ptr[0] = A_global_ptr[0];
+          A_shared_ptr[256] = A_global_ptr[256];
+          B_shared_ptr[0] = B_global_ptr[0];
+          B_shared_ptr[256] = B_global_ptr[256];
+          A_shared_ptr += A_tile_size;
+          B_shared_ptr += B_tile_size;
+          A_global_ptr += A_tile_size;
+          B_global_ptr += B_tile_size;
+        }
+      }
+      __syncthreads();
+
+      {
+        const float *A_shared_ptr = A_shared + (tid % 64);
+        const float *B_shared_ptr = B_shared + tid;
+        for (int k_outer_shared = 0; k_outer_shared < K_outer_shared_size;
+             ++k_outer_shared) {
+          acc00 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[0], B_shared_ptr[0], acc00, 0, 0, 0);
+          acc01 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[0], B_shared_ptr[256], acc01, 0, 0, 0);
+          acc10 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[64], B_shared_ptr[0], acc10, 0, 0, 0);
+          acc11 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[64], B_shared_ptr[256], acc11, 0, 0, 0);
+          acc20 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[128], B_shared_ptr[0], acc20, 0, 0, 0);
+          acc21 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[128], B_shared_ptr[256], acc21, 0, 0, 0);
+          acc30 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[192], B_shared_ptr[0], acc30, 0, 0, 0);
+          acc31 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[192], B_shared_ptr[256], acc31, 0, 0, 0);
+          acc40 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[256], B_shared_ptr[0], acc40, 0, 0, 0);
+          acc41 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[256], B_shared_ptr[256], acc41, 0, 0, 0);
+          acc50 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[320], B_shared_ptr[0], acc50, 0, 0, 0);
+          acc51 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[320], B_shared_ptr[256], acc51, 0, 0, 0);
+          acc60 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[384], B_shared_ptr[0], acc60, 0, 0, 0);
+          acc61 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[384], B_shared_ptr[256], acc61, 0, 0, 0);
+          acc70 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[448], B_shared_ptr[0], acc70, 0, 0, 0);
+          acc71 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[448], B_shared_ptr[256], acc71, 0, 0, 0);
+          A_shared_ptr += A_tile_size;
+          B_shared_ptr += B_tile_size;
+        }
+      }
+      __syncthreads();
+    }
+
+    // Handle remainder: the last shared tile has a smaller K-size.
+    if (k_outer_global < K_outer) {
+      int K_remaining_outer_size = K_outer - k_outer_global;
+      {
+        float *A_shared_ptr = A_shared + tid;
+        float *B_shared_ptr = B_shared + tid;
+        for (int k_outer_shared = 0; k_outer_shared < K_remaining_outer_size;
+             ++k_outer_shared) {
+          A_shared_ptr[0] = A_global_ptr[0];
+          A_shared_ptr[256] = A_global_ptr[256];
+          B_shared_ptr[0] = B_global_ptr[0];
+          B_shared_ptr[256] = B_global_ptr[256];
+          A_shared_ptr += A_tile_size;
+          B_shared_ptr += B_tile_size;
+          A_global_ptr += A_tile_size;
+          B_global_ptr += B_tile_size;
+        }
+      }
+      __syncthreads();
+
+      {
+        const float *A_shared_ptr = A_shared + (tid % 64);
+        const float *B_shared_ptr = B_shared + tid;
+        for (int k_outer_shared = 0; k_outer_shared < K_remaining_outer_size;
+             ++k_outer_shared) {
+          acc00 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[0], B_shared_ptr[0], acc00, 0, 0, 0);
+          acc01 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[0], B_shared_ptr[256], acc01, 0, 0, 0);
+          acc10 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[64], B_shared_ptr[0], acc10, 0, 0, 0);
+          acc11 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[64], B_shared_ptr[256], acc11, 0, 0, 0);
+          acc20 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[128], B_shared_ptr[0], acc20, 0, 0, 0);
+          acc21 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[128], B_shared_ptr[256], acc21, 0, 0, 0);
+          acc30 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[192], B_shared_ptr[0], acc30, 0, 0, 0);
+          acc31 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[192], B_shared_ptr[256], acc31, 0, 0, 0);
+          acc40 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[256], B_shared_ptr[0], acc40, 0, 0, 0);
+          acc41 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[256], B_shared_ptr[256], acc41, 0, 0, 0);
+          acc50 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[320], B_shared_ptr[0], acc50, 0, 0, 0);
+          acc51 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[320], B_shared_ptr[256], acc51, 0, 0, 0);
+          acc60 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[384], B_shared_ptr[0], acc60, 0, 0, 0);
+          acc61 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[384], B_shared_ptr[256], acc61, 0, 0, 0);
+          acc70 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[448], B_shared_ptr[0], acc70, 0, 0, 0);
+          acc71 = __builtin_amdgcn_mfma_f32_16x16x4f32(
+              A_shared_ptr[448], B_shared_ptr[256], acc71, 0, 0, 0);
+          A_shared_ptr += A_tile_size;
+          B_shared_ptr += B_tile_size;
+        }
+      }
+      __syncthreads();
+    }
+
+    float *C_ptr = C_data + 16384 * (N_outer * m_outer + n_outer);
+    reinterpret_cast<floatx4_t *>(C_ptr + 0)[tid] = acc00;
+    reinterpret_cast<floatx4_t *>(C_ptr + 1024)[tid] = acc01;
+    reinterpret_cast<floatx4_t *>(C_ptr + 2 * 1024)[tid] = acc10;
+    reinterpret_cast<floatx4_t *>(C_ptr + 3 * 1024)[tid] = acc11;
+    reinterpret_cast<floatx4_t *>(C_ptr + 4 * 1024)[tid] = acc20;
+    reinterpret_cast<floatx4_t *>(C_ptr + 5 * 1024)[tid] = acc21;
+    reinterpret_cast<floatx4_t *>(C_ptr + 6 * 1024)[tid] = acc30;
+    reinterpret_cast<floatx4_t *>(C_ptr + 7 * 1024)[tid] = acc31;
+    reinterpret_cast<floatx4_t *>(C_ptr + 8 * 1024)[tid] = acc40;
+    reinterpret_cast<floatx4_t *>(C_ptr + 9 * 1024)[tid] = acc41;
+    reinterpret_cast<floatx4_t *>(C_ptr + 10 * 1024)[tid] = acc50;
+    reinterpret_cast<floatx4_t *>(C_ptr + 11 * 1024)[tid] = acc51;
+    reinterpret_cast<floatx4_t *>(C_ptr + 12 * 1024)[tid] = acc60;
+    reinterpret_cast<floatx4_t *>(C_ptr + 13 * 1024)[tid] = acc61;
+    reinterpret_cast<floatx4_t *>(C_ptr + 14 * 1024)[tid] = acc70;
+    reinterpret_cast<floatx4_t *>(C_ptr + 15 * 1024)[tid] = acc71;
+  }
+};
+
 int main() {
   test(MmtKernel_generic<3, 5, 2>());
   test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_rowmajor());
@@ -913,4 +1129,5 @@ int main() {
   test(MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_direct());
   test(MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_shared());
   test(MmtKernel_4x4_amdgcn_mfma_f32_16x16x4f32_shared());
+  test(MmtKernel_8x8_amdgcn_mfma_f32_16x16x4f32_shared());
 }

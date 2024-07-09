@@ -129,8 +129,8 @@ public:
 
 TiledMmtShape getTestShape(const MmtKernel &kernel) {
   int M = getIntEnvVar("M", 4096);
-  int N = getIntEnvVar("N", 2048);
-  int K = getIntEnvVar("K", 2048);
+  int N = getIntEnvVar("N", 4096);
+  int K = getIntEnvVar("K", 4096);
   TiledMmtShape s;
   s.M_outer = std::max(1, M / kernel.M_tile0());
   s.N_outer = std::max(1, N / kernel.N_tile0());
@@ -144,14 +144,7 @@ TiledMmtShape getTestShape(const MmtKernel &kernel) {
   return s;
 }
 
-void test(const MmtKernel &kernel) {
-  char *name =
-      abi::__cxa_demangle(typeid(kernel).name(), nullptr, nullptr, nullptr);
-  const char *filter = getenv("FILTER");
-  if (filter && !strstr(name, filter)) {
-    return;
-  }
-  TiledMmtShape s = getTestShape(kernel);
+void check(const MmtKernel &kernel, const TiledMmtShape &s) {
   std::minstd_rand random_engine;
   std::vector<float> A_host_data =
       makeRandomFloatVector(flatsize(A_shape(s)), random_engine);
@@ -181,25 +174,50 @@ void test(const MmtKernel &kernel) {
   const dim3 grid_dim(s.M_outer, s.N_outer);
   const dim3 block_dim(kernel.num_threads());
 
-  printf("%s: MxNxK outer=(%dx%dx%d) tile0=(%dx%dx%d) num_threads=%d\n", name,
-         s.M_outer, s.N_outer, s.K_outer, s.M_tile0, s.N_tile0, s.K_tile0,
-         kernel.num_threads());
-  free(name);
+  kernel.mmt_func()<<<grid_dim, block_dim, 0, hipStreamDefault>>>(
+      A_device_buffer, B_device_buffer, C_device_buffer, s.N_outer, s.K_outer);
+  HIP_CHECK(hipGetLastError());
+  HIP_CHECK(hipMemcpy(C_host_data.data(), C_device_buffer, C_bytes,
+                      hipMemcpyDeviceToHost));
+  checkMmtResults(A_host_data.data(), B_host_data.data(), C_host_data.data(),
+                  s);
 
-  if (!getIntEnvVar("SKIP_CHECK", 0)) {
-    printf("  Checking correctness... ");
-    kernel.mmt_func()<<<grid_dim, block_dim, 0, hipStreamDefault>>>(
-        A_device_buffer, B_device_buffer, C_device_buffer, s.N_outer,
-        s.K_outer);
-    HIP_CHECK(hipGetLastError());
-    HIP_CHECK(hipMemcpy(C_host_data.data(), C_device_buffer, C_bytes,
-                        hipMemcpyDeviceToHost));
-    checkMmtResults(A_host_data.data(), B_host_data.data(), C_host_data.data(),
-                    s);
-    printf("OK\n");
-  }
+  HIP_CHECK(hipFree(A_device_buffer));
+  HIP_CHECK(hipFree(B_device_buffer));
+  HIP_CHECK(hipFree(C_device_buffer));
+  HIP_CHECK(hipFree(shape_device_buffer));
+}
 
-  printf("  Benchmarking... ");
+void benchmark(const MmtKernel &kernel, const TiledMmtShape &s) {
+  std::minstd_rand random_engine;
+  std::vector<float> A_host_data =
+      makeRandomFloatVector(flatsize(A_shape(s)), random_engine);
+  std::vector<float> B_host_data =
+      makeRandomFloatVector(flatsize(B_shape(s)), random_engine);
+  std::vector<float> C_host_data(flatsize(C_shape(s)));
+
+  const size_t A_bytes = sizeof(float) * A_host_data.size();
+  const size_t B_bytes = sizeof(float) * B_host_data.size();
+  const size_t C_bytes = sizeof(float) * C_host_data.size();
+  float *A_device_buffer{};
+  float *B_device_buffer{};
+  float *C_device_buffer{};
+  TiledMmtShape *shape_device_buffer{};
+  HIP_CHECK(hipMalloc(&A_device_buffer, A_bytes));
+  HIP_CHECK(hipMalloc(&B_device_buffer, B_bytes));
+  HIP_CHECK(hipMalloc(&C_device_buffer, C_bytes));
+  HIP_CHECK(hipMalloc(&shape_device_buffer, sizeof s));
+
+  HIP_CHECK(hipMemcpy(A_device_buffer, A_host_data.data(), A_bytes,
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(B_device_buffer, B_host_data.data(), B_bytes,
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(
+      hipMemcpy(shape_device_buffer, &s, sizeof s, hipMemcpyHostToDevice));
+
+  const dim3 grid_dim(s.M_outer, s.N_outer);
+  const dim3 block_dim(kernel.num_threads());
+
   hipEvent_t start, stop;
   HIP_CHECK(hipEventCreate(&start));
   HIP_CHECK(hipEventCreate(&stop));
@@ -244,6 +262,34 @@ void test(const MmtKernel &kernel) {
   HIP_CHECK(hipFree(B_device_buffer));
   HIP_CHECK(hipFree(C_device_buffer));
   HIP_CHECK(hipFree(shape_device_buffer));
+}
+
+void test(const MmtKernel &kernel) {
+  char *name =
+      abi::__cxa_demangle(typeid(kernel).name(), nullptr, nullptr, nullptr);
+  const char *filter = getenv("FILTER");
+  if (filter && !strstr(name, filter)) {
+    return;
+  }
+  TiledMmtShape s = getTestShape(kernel);
+  printf("%s: MxNxK outer=(%dx%dx%d) tile0=(%dx%dx%d) num_threads=%d\n", name,
+         s.M_outer, s.N_outer, s.K_outer, s.M_tile0, s.N_tile0, s.K_tile0,
+         kernel.num_threads());
+  free(name);
+
+  if (!getIntEnvVar("SKIP_CHECK", 0)) {
+    printf("  Checking correctness... ");
+    // Test with more generic shapes than just M==N==K==2^x.
+    TiledMmtShape s_tweaked{s};
+    s_tweaked.M_outer += 1;
+    s_tweaked.N_outer += 3;
+    s_tweaked.K_outer += 5;
+    check(kernel, s_tweaked);
+    printf("OK\n");
+  }
+
+  printf("  Benchmarking... ");
+  benchmark(kernel, s);
 }
 
 template <int T_M_tile0, int T_N_tile0, int T_K_tile0>

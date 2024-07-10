@@ -950,7 +950,8 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
 };
 
 template <int MS, int NS>
-class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB : public MmtKernel {
+class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB
+    : public MmtKernel {
   static_assert(NS >= 4 && !(NS % 4));
   virtual int M_tile() const override { return MS * 16; }
   virtual int N_tile() const override { return NS * 16; }

@@ -64,20 +64,81 @@ __device__ __host__ int offset(const TiledMatrixShape &s, int r_outer,
          s.rows_tile * s.cols_tile * (c_outer + s.cols_outer * r_outer);
 }
 
-std::vector<float> makeRandomFloatVector(int size, std::minstd_rand &r) {
-  std::vector<float> v(size);
-  for (float &x : v) {
+enum class Type { SI8, SI16, SI32, FP16, FP32 };
+
+int type_size(Type t) {
+  switch (t) {
+  case Type::SI8:
+    return 1;
+  case Type::SI16:
+    return 2;
+  case Type::SI32:
+    return 4;
+  case Type::FP16:
+    return 2;
+  case Type::FP32:
+    return 4;
+  }
+}
+
+template <Type t> struct CTypeImpl {};
+template <> struct CTypeImpl<Type::SI8> {
+  using type = int8_t;
+};
+template <> struct CTypeImpl<Type::SI16> {
+  using type = int16_t;
+};
+template <> struct CTypeImpl<Type::SI32> {
+  using type = int32_t;
+};
+template <> struct CTypeImpl<Type::FP16> {
+  using type = __fp16;
+};
+template <> struct CTypeImpl<Type::FP32> {
+  using type = float;
+};
+template <Type t> using CType = CTypeImpl<t>::type;
+
+template <Type type>
+void fillRandomBuffer(int size, std::minstd_rand &r, void *out_buffer) {
+  using T = CType<type>;
+  T *out_buffer_typed = static_cast<T *>(out_buffer);
+  for (int i = 0; i < size; ++i) {
     // Generate small integers in [-2, +2] so products are in [-4, +4] so
     // accumulators are in [-4K, +4K] for accumulation depth K so they're
     // exactly representable, float rounding is exact and we don't need
     // fuzzy compares.
-    x = static_cast<float>(static_cast<int>((r() % 5)) - 2);
+    out_buffer_typed[i] = static_cast<T>(static_cast<int>((r() % 5)) - 2);
   }
-  return v;
 }
 
-void checkMmtResults(const float *A_data, const float *B_data,
-                     const float *C_data, const TiledMmtShape &s) {
+std::vector<std::byte> makeRandomBuffer(Type type, int size,
+                                        std::minstd_rand &r) {
+  int bytes = size * type_size(type);
+  std::vector<std::byte> result(bytes);
+  if (type == Type::SI8) {
+    fillRandomBuffer<Type::SI8>(size, r, result.data());
+  } else if (type == Type::SI16) {
+    fillRandomBuffer<Type::SI16>(size, r, result.data());
+  } else if (type == Type::SI32) {
+    fillRandomBuffer<Type::SI32>(size, r, result.data());
+  } else if (type == Type::FP16) {
+    fillRandomBuffer<Type::FP16>(size, r, result.data());
+  } else if (type == Type::FP32) {
+    fillRandomBuffer<Type::FP32>(size, r, result.data());
+  }
+  return result;
+}
+
+template <Type A_type, Type B_type, Type C_type>
+void checkMmtResults(const void *A_data_void, const void *B_data_void,
+                     const void *C_data_void, const TiledMmtShape &s) {
+  using TA = CType<A_type>;
+  using TB = CType<B_type>;
+  using TC = CType<C_type>;
+  const TA *A_data = static_cast<const TA *>(A_data_void);
+  const TB *B_data = static_cast<const TB *>(B_data_void);
+  const TC *C_data = static_cast<const TC *>(C_data_void);
   // This reference code is slow. To make the checks not too slow on
   // large matmuls, we only check the 4 corner tiles.
   for (int m_outer : {0, s.M_outer - 1}) {
@@ -87,23 +148,23 @@ void checkMmtResults(const float *A_data, const float *B_data,
           float c = 0.f;
           for (int k_outer = 0; k_outer < s.K_outer; ++k_outer) {
             for (int k_tile = 0; k_tile < s.K_tile; ++k_tile) {
-              float a =
+              TA a =
                   A_data[offset(A_shape(s), m_outer, k_outer, m_tile, k_tile)];
-              float b =
+              TB b =
                   B_data[offset(B_shape(s), n_outer, k_outer, n_tile, k_tile)];
-              c += a * b;
+              c += static_cast<TC>(a) * static_cast<TC>(b);
             }
           }
-          float expected = c;
-          float actual =
+          TC expected = c;
+          TC actual =
               C_data[offset(C_shape(s), m_outer, n_outer, m_tile, n_tile)];
           if (actual != expected) {
             fprintf(stderr,
                     "matmul numerical error: actual(%g) != "
                     "expected(%g), at m_outer=%d n_outer=%d m_tile=%d "
                     "n_tile=%d, at %s:%d\n",
-                    actual, expected, m_outer, n_outer, m_tile, n_tile,
-                    __FILE__, __LINE__);
+                    static_cast<float>(actual), static_cast<float>(expected),
+                    m_outer, n_outer, m_tile, n_tile, __FILE__, __LINE__);
             abort();
           }
         }
@@ -112,11 +173,32 @@ void checkMmtResults(const float *A_data, const float *B_data,
   }
 }
 
-typedef void (*mmt_func_t)(const float *, const float *, float *, int, int);
+void checkMmtResults(Type A_type, Type B_type, Type C_type,
+                     const void *A_data_void, const void *B_data_void,
+                     const void *C_data_void, const TiledMmtShape &s) {
+#define HANDLE_CASE(A, B, C)                                                   \
+  if (A_type == Type::A && B_type == Type::B && C_type == Type::C) {           \
+    checkMmtResults<Type::A, Type::B, Type::C>(A_data_void, B_data_void,       \
+                                               C_data_void, s);                \
+    return;                                                                    \
+  }
+  HANDLE_CASE(FP32, FP32, FP32)
+  HANDLE_CASE(FP16, FP16, FP16)
+  HANDLE_CASE(SI8, SI8, SI32)
+#undef HANDLE_CASE
+
+  fprintf(stderr, "%s:%d: unhandled types\n", __FILE__, __LINE__);
+  abort();
+}
+
+typedef void (*mmt_func_t)(const void *, const void *, void *, int, int);
 
 class MmtKernel {
 public:
   virtual ~MmtKernel(){};
+  virtual Type A_type() const = 0;
+  virtual Type B_type() const = 0;
+  virtual Type C_type() const = 0;
   virtual int M_tile() const = 0;
   virtual int N_tile() const = 0;
   virtual int K_tile() const = 0;
@@ -146,27 +228,27 @@ TiledMmtShape getTestShape(const MmtKernel &kernel) {
 
 void check(const MmtKernel &kernel, const TiledMmtShape &s) {
   std::minstd_rand random_engine;
-  std::vector<float> A_host_data =
-      makeRandomFloatVector(flatsize(A_shape(s)), random_engine);
-  std::vector<float> B_host_data =
-      makeRandomFloatVector(flatsize(B_shape(s)), random_engine);
-  std::vector<float> C_host_data(flatsize(C_shape(s)));
+  std::vector<std::byte> A_host_data =
+      makeRandomBuffer(kernel.A_type(), flatsize(A_shape(s)), random_engine);
+  std::vector<std::byte> B_host_data =
+      makeRandomBuffer(kernel.B_type(), flatsize(B_shape(s)), random_engine);
+  std::vector<std::byte> C_host_data =
+      makeRandomBuffer(kernel.C_type(), flatsize(C_shape(s)), random_engine);
 
-  const size_t A_bytes = sizeof(float) * A_host_data.size();
-  const size_t B_bytes = sizeof(float) * B_host_data.size();
-  const size_t C_bytes = sizeof(float) * C_host_data.size();
   float *A_device_buffer{};
   float *B_device_buffer{};
   float *C_device_buffer{};
   TiledMmtShape *shape_device_buffer{};
-  HIP_CHECK(hipMalloc(&A_device_buffer, A_bytes));
-  HIP_CHECK(hipMalloc(&B_device_buffer, B_bytes));
-  HIP_CHECK(hipMalloc(&C_device_buffer, C_bytes));
+  HIP_CHECK(hipMalloc(&A_device_buffer, A_host_data.size()));
+  HIP_CHECK(hipMalloc(&B_device_buffer, B_host_data.size()));
+  HIP_CHECK(hipMalloc(&C_device_buffer, C_host_data.size()));
   HIP_CHECK(hipMalloc(&shape_device_buffer, sizeof s));
 
-  HIP_CHECK(hipMemcpy(A_device_buffer, A_host_data.data(), A_bytes,
+  HIP_CHECK(hipMemcpy(A_device_buffer, A_host_data.data(), A_host_data.size(),
                       hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(B_device_buffer, B_host_data.data(), B_bytes,
+  HIP_CHECK(hipMemcpy(B_device_buffer, B_host_data.data(), B_host_data.size(),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(C_device_buffer, C_host_data.data(), C_host_data.size(),
                       hipMemcpyHostToDevice));
   HIP_CHECK(
       hipMemcpy(shape_device_buffer, &s, sizeof s, hipMemcpyHostToDevice));
@@ -177,9 +259,10 @@ void check(const MmtKernel &kernel, const TiledMmtShape &s) {
   kernel.mmt_func()<<<grid_dim, block_dim, 0, hipStreamDefault>>>(
       A_device_buffer, B_device_buffer, C_device_buffer, s.N_outer, s.K_outer);
   HIP_CHECK(hipGetLastError());
-  HIP_CHECK(hipMemcpy(C_host_data.data(), C_device_buffer, C_bytes,
+  HIP_CHECK(hipMemcpy(C_host_data.data(), C_device_buffer, C_host_data.size(),
                       hipMemcpyDeviceToHost));
-  checkMmtResults(A_host_data.data(), B_host_data.data(), C_host_data.data(),
+  checkMmtResults(kernel.A_type(), kernel.B_type(), kernel.C_type(),
+                  A_host_data.data(), B_host_data.data(), C_host_data.data(),
                   s);
 
   HIP_CHECK(hipFree(A_device_buffer));
@@ -190,27 +273,27 @@ void check(const MmtKernel &kernel, const TiledMmtShape &s) {
 
 void benchmark(const MmtKernel &kernel, const TiledMmtShape &s) {
   std::minstd_rand random_engine;
-  std::vector<float> A_host_data =
-      makeRandomFloatVector(flatsize(A_shape(s)), random_engine);
-  std::vector<float> B_host_data =
-      makeRandomFloatVector(flatsize(B_shape(s)), random_engine);
-  std::vector<float> C_host_data(flatsize(C_shape(s)));
+  std::vector<std::byte> A_host_data =
+      makeRandomBuffer(kernel.A_type(), flatsize(A_shape(s)), random_engine);
+  std::vector<std::byte> B_host_data =
+      makeRandomBuffer(kernel.B_type(), flatsize(B_shape(s)), random_engine);
+  std::vector<std::byte> C_host_data =
+      makeRandomBuffer(kernel.C_type(), flatsize(C_shape(s)), random_engine);
 
-  const size_t A_bytes = sizeof(float) * A_host_data.size();
-  const size_t B_bytes = sizeof(float) * B_host_data.size();
-  const size_t C_bytes = sizeof(float) * C_host_data.size();
   float *A_device_buffer{};
   float *B_device_buffer{};
   float *C_device_buffer{};
   TiledMmtShape *shape_device_buffer{};
-  HIP_CHECK(hipMalloc(&A_device_buffer, A_bytes));
-  HIP_CHECK(hipMalloc(&B_device_buffer, B_bytes));
-  HIP_CHECK(hipMalloc(&C_device_buffer, C_bytes));
+  HIP_CHECK(hipMalloc(&A_device_buffer, A_host_data.size()));
+  HIP_CHECK(hipMalloc(&B_device_buffer, B_host_data.size()));
+  HIP_CHECK(hipMalloc(&C_device_buffer, C_host_data.size()));
   HIP_CHECK(hipMalloc(&shape_device_buffer, sizeof s));
 
-  HIP_CHECK(hipMemcpy(A_device_buffer, A_host_data.data(), A_bytes,
+  HIP_CHECK(hipMemcpy(A_device_buffer, A_host_data.data(), A_host_data.size(),
                       hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(B_device_buffer, B_host_data.data(), B_bytes,
+  HIP_CHECK(hipMemcpy(B_device_buffer, B_host_data.data(), B_host_data.size(),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(C_device_buffer, C_host_data.data(), C_host_data.size(),
                       hipMemcpyHostToDevice));
   HIP_CHECK(
       hipMemcpy(shape_device_buffer, &s, sizeof s, hipMemcpyHostToDevice));
@@ -296,6 +379,9 @@ void test(const MmtKernel &kernel) {
 
 template <int T_M_tile, int T_N_tile, int T_K_tile>
 class MmtKernel_generic : public MmtKernel {
+  virtual Type A_type() const override { return Type::FP32; }
+  virtual Type B_type() const override { return Type::FP32; }
+  virtual Type C_type() const override { return Type::FP32; }
   virtual int M_tile() const override { return T_M_tile; }
   virtual int N_tile() const override { return T_N_tile; }
   virtual int K_tile() const override { return T_K_tile; }
@@ -310,8 +396,8 @@ class MmtKernel_generic : public MmtKernel {
   }
   virtual int num_threads() const override { return T_M_tile * T_N_tile; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const float *A_data, const float *B_data,
-                             float *C_data, int N_outer, int K_outer) {
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int N_outer, int K_outer) {
     int m_outer = blockIdx.x;
     int n_outer = blockIdx.y;
     int m_tile = threadIdx.x / T_N_tile;
@@ -319,21 +405,28 @@ class MmtKernel_generic : public MmtKernel {
     float c = 0.f;
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       for (int k_tile = 0; k_tile < T_K_tile; ++k_tile) {
-        float a = A_data[k_tile +
-                         T_K_tile * (m_tile +
-                                     T_M_tile * (k_outer + K_outer * m_outer))];
-        float b = B_data[k_tile +
-                         T_K_tile * (n_tile +
-                                     T_N_tile * (k_outer + K_outer * n_outer))];
+        float a = static_cast<const float *>(
+            A_data)[k_tile +
+                    T_K_tile *
+                        (m_tile + T_M_tile * (k_outer + K_outer * m_outer))];
+        float b = static_cast<const float *>(
+            B_data)[k_tile +
+                    T_K_tile *
+                        (n_tile + T_N_tile * (k_outer + K_outer * n_outer))];
         c += a * b;
       }
     }
-    C_data[n_tile +
-           T_N_tile * (m_tile + T_M_tile * (n_outer + N_outer * m_outer))] = c;
+    static_cast<float *>(
+        C_data)[n_tile + T_N_tile * (m_tile + T_M_tile * (n_outer +
+                                                          N_outer * m_outer))] =
+        c;
   }
 };
 
 class MmtKernel_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MmtKernel {
+  virtual Type A_type() const override { return Type::FP32; }
+  virtual Type B_type() const override { return Type::FP32; }
+  virtual Type C_type() const override { return Type::FP32; }
   virtual int M_tile() const override { return 16; }
   virtual int N_tile() const override { return 16; }
   virtual int K_tile() const override { return 4; }
@@ -348,8 +441,8 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MmtKernel {
   }
   virtual int num_threads() const override { return 64; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const float *A_data, const float *B_data,
-                             float *C_data, int N_outer, int K_outer) {
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -361,8 +454,10 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MmtKernel {
     int bj = tid % 16;
     int bk = tid / 16;
 
-    const float *A_ptr = A_data + m_outer * K_outer * 64 + ai * 4 + ak;
-    const float *B_ptr = B_data + n_outer * K_outer * 64 + bk * 16 + bj;
+    const float *A_ptr = static_cast<const float *>(A_data) +
+                         m_outer * K_outer * 64 + ai * 4 + ak;
+    const float *B_ptr = static_cast<const float *>(B_data) +
+                         n_outer * K_outer * 64 + bk * 16 + bj;
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       acc = __builtin_amdgcn_mfma_f32_16x16x4f32(*A_ptr, *B_ptr, acc, 0, 0, 0);
@@ -373,13 +468,18 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MmtKernel {
     for (int gpr = 0; gpr < 4; ++gpr) {
       int ci = 4 * (tid / 16) + gpr;
       int cj = tid % 16;
-      C_data[m_outer * N_outer * 256 + n_outer * 256 + ci * 16 + cj] = acc[gpr];
+      static_cast<float *>(
+          C_data)[m_outer * N_outer * 256 + n_outer * 256 + ci * 16 + cj] =
+          acc[gpr];
     }
   }
 };
 
 class MmtKernel_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC
     : public MmtKernel {
+  virtual Type A_type() const override { return Type::FP32; }
+  virtual Type B_type() const override { return Type::FP32; }
+  virtual Type C_type() const override { return Type::FP32; }
   virtual int M_tile() const override { return 16; }
   virtual int N_tile() const override { return 16; }
   virtual int K_tile() const override { return 4; }
@@ -394,8 +494,8 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC
   }
   virtual int num_threads() const override { return 64; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const float *A_data, const float *B_data,
-                             float *C_data, int N_outer, int K_outer) {
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -403,8 +503,10 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC
     int n_outer = blockIdx.y;
     int tid = threadIdx.x;
 
-    const float *A_ptr = A_data + m_outer * K_outer * 64 + tid;
-    const float *B_ptr = B_data + n_outer * K_outer * 64 + tid;
+    const float *A_ptr =
+        static_cast<const float *>(A_data) + m_outer * K_outer * 64 + tid;
+    const float *B_ptr =
+        static_cast<const float *>(B_data) + n_outer * K_outer * 64 + tid;
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       acc = __builtin_amdgcn_mfma_f32_16x16x4f32(*A_ptr, *B_ptr, acc, 0, 0, 0);
@@ -415,12 +517,17 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC
     for (int gpr = 0; gpr < 4; ++gpr) {
       int ci = 4 * (tid / 16) + gpr;
       int cj = tid % 16;
-      C_data[m_outer * N_outer * 256 + n_outer * 256 + ci * 16 + cj] = acc[gpr];
+      static_cast<float *>(
+          C_data)[m_outer * N_outer * 256 + n_outer * 256 + ci * 16 + cj] =
+          acc[gpr];
     }
   }
 };
 
 class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
+  virtual Type A_type() const override { return Type::FP32; }
+  virtual Type B_type() const override { return Type::FP32; }
+  virtual Type C_type() const override { return Type::FP32; }
   virtual int M_tile() const override { return 16; }
   virtual int N_tile() const override { return 16; }
   virtual int K_tile() const override { return 4; }
@@ -435,8 +542,8 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   }
   virtual int num_threads() const override { return 64; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const float *A_data, const float *B_data,
-                             float *C_data, int N_outer, int K_outer) {
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -444,8 +551,10 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
     int n_outer = blockIdx.y;
     int tid = threadIdx.x;
 
-    const float *A_ptr = A_data + m_outer * K_outer * 64 + tid;
-    const float *B_ptr = B_data + n_outer * K_outer * 64 + tid;
+    const float *A_ptr =
+        static_cast<const float *>(A_data) + m_outer * K_outer * 64 + tid;
+    const float *B_ptr =
+        static_cast<const float *>(B_data) + n_outer * K_outer * 64 + tid;
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       acc = __builtin_amdgcn_mfma_f32_16x16x4f32(*A_ptr, *B_ptr, acc, 0, 0, 0);
@@ -453,12 +562,15 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
       B_ptr += 64;
     }
 
-    reinterpret_cast<floatx4_t *>(
-        C_data + 256 * (N_outer * m_outer + n_outer))[tid] = acc;
+    static_cast<floatx4_t *>(C_data)[64 * (N_outer * m_outer + n_outer) + tid] =
+        acc;
   }
 };
 
 class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct_Kx4 : public MmtKernel {
+  virtual Type A_type() const override { return Type::FP32; }
+  virtual Type B_type() const override { return Type::FP32; }
+  virtual Type C_type() const override { return Type::FP32; }
   virtual int M_tile() const override { return 16; }
   virtual int N_tile() const override { return 16; }
   virtual int K_tile() const override { return 16; }
@@ -473,8 +585,8 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct_Kx4 : public MmtKernel {
   }
   virtual int num_threads() const override { return 64; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const float *A_data, const float *B_data,
-                             float *C_data, int N_outer, int K_outer) {
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -482,8 +594,10 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct_Kx4 : public MmtKernel {
     int n_outer = blockIdx.y;
     int tid = threadIdx.x;
 
-    const float *A_ptr = A_data + m_outer * K_outer * 256 + 4 * tid;
-    const float *B_ptr = B_data + n_outer * K_outer * 256 + 4 * tid;
+    const float *A_ptr =
+        static_cast<const float *>(A_data) + m_outer * K_outer * 256 + 4 * tid;
+    const float *B_ptr =
+        static_cast<const float *>(B_data) + n_outer * K_outer * 256 + 4 * tid;
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       acc = __builtin_amdgcn_mfma_f32_16x16x4f32(A_ptr[0], B_ptr[0], acc, 0, 0,
@@ -498,13 +612,16 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct_Kx4 : public MmtKernel {
       B_ptr += 256;
     }
 
-    reinterpret_cast<floatx4_t *>(
-        C_data + 256 * (N_outer * m_outer + n_outer))[tid] = acc;
+    static_cast<floatx4_t *>(C_data)[64 * (N_outer * m_outer + n_outer) + tid] =
+        acc;
   }
 };
 
 class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4
     : public MmtKernel {
+  virtual Type A_type() const override { return Type::FP32; }
+  virtual Type B_type() const override { return Type::FP32; }
+  virtual Type C_type() const override { return Type::FP32; }
   virtual int M_tile() const override { return 16; }
   virtual int N_tile() const override { return 16; }
   virtual int K_tile() const override { return 16; }
@@ -519,8 +636,8 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4
   }
   virtual int num_threads() const override { return 64; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const float *A_data, const float *B_data,
-                             float *C_data, int N_outer, int K_outer) {
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -528,10 +645,10 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4
     int n_outer = blockIdx.y;
     int tid = threadIdx.x;
 
-    const floatx4_t *A_ptr = reinterpret_cast<const floatx4_t *>(A_data) +
-                             m_outer * K_outer * 64 + tid;
-    const floatx4_t *B_ptr = reinterpret_cast<const floatx4_t *>(B_data) +
-                             n_outer * K_outer * 64 + tid;
+    const floatx4_t *A_ptr =
+        static_cast<const floatx4_t *>(A_data) + m_outer * K_outer * 64 + tid;
+    const floatx4_t *B_ptr =
+        static_cast<const floatx4_t *>(B_data) + n_outer * K_outer * 64 + tid;
 
     int k_outer = 0;
     for (; k_outer <= K_outer - 4; k_outer += 4) {
@@ -573,12 +690,15 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4
       B_ptr += 64;
     }
 
-    reinterpret_cast<floatx4_t *>(
-        C_data + 256 * (N_outer * m_outer + n_outer))[tid] = acc;
+    static_cast<floatx4_t *>(C_data)[64 * (N_outer * m_outer + n_outer) + tid] =
+        acc;
   }
 };
 
 class MmtKernel_1x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
+  virtual Type A_type() const override { return Type::FP32; }
+  virtual Type B_type() const override { return Type::FP32; }
+  virtual Type C_type() const override { return Type::FP32; }
   virtual int M_tile() const override { return 16; }
   virtual int N_tile() const override { return 32; }
   virtual int K_tile() const override { return 4; }
@@ -601,8 +721,8 @@ class MmtKernel_1x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   }
   virtual int num_threads() const override { return 128; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const float *A_data, const float *B_data,
-                             float *C_data, int N_outer, int K_outer) {
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -610,8 +730,10 @@ class MmtKernel_1x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
     int n_outer = blockIdx.y;
     int tid = threadIdx.x;
 
-    const float *A_ptr = A_data + m_outer * K_outer * 64 + (tid % 64);
-    const float *B_ptr = B_data + n_outer * K_outer * 128 + tid;
+    const float *A_ptr = static_cast<const float *>(A_data) +
+                         m_outer * K_outer * 64 + (tid % 64);
+    const float *B_ptr =
+        static_cast<const float *>(B_data) + n_outer * K_outer * 128 + tid;
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       acc = __builtin_amdgcn_mfma_f32_16x16x4f32(*A_ptr, *B_ptr, acc, 0, 0, 0);
@@ -619,12 +741,15 @@ class MmtKernel_1x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
       B_ptr += 128;
     }
 
-    reinterpret_cast<floatx4_t *>(
-        C_data + 512 * (N_outer * m_outer + n_outer))[tid] = acc;
+    static_cast<floatx4_t *>(
+        C_data)[128 * (N_outer * m_outer + n_outer) + tid] = acc;
   }
 };
 
 class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
+  virtual Type A_type() const override { return Type::FP32; }
+  virtual Type B_type() const override { return Type::FP32; }
+  virtual Type C_type() const override { return Type::FP32; }
   virtual int M_tile() const override { return 32; }
   virtual int N_tile() const override { return 32; }
   virtual int K_tile() const override { return 4; }
@@ -653,8 +778,8 @@ class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const float *A_data, const float *B_data,
-                             float *C_data, int N_outer, int K_outer) {
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -662,9 +787,11 @@ class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
     int n_outer = blockIdx.y;
     int tid = threadIdx.x;
 
-    const float *A_ptr =
-        A_data + m_outer * K_outer * 128 + (tid % 64) + 64 * (tid / 128);
-    const float *B_ptr = B_data + n_outer * K_outer * 128 + (tid % 128);
+    const float *A_ptr = static_cast<const float *>(A_data) +
+                         m_outer * K_outer * 128 + (tid % 64) +
+                         64 * (tid / 128);
+    const float *B_ptr = static_cast<const float *>(B_data) +
+                         n_outer * K_outer * 128 + (tid % 128);
 
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       acc = __builtin_amdgcn_mfma_f32_16x16x4f32(*A_ptr, *B_ptr, acc, 0, 0, 0);
@@ -672,12 +799,15 @@ class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
       B_ptr += 128;
     }
 
-    reinterpret_cast<floatx4_t *>(
-        C_data + 1024 * (N_outer * m_outer + n_outer))[tid] = acc;
+    static_cast<floatx4_t *>(
+        C_data)[256 * (N_outer * m_outer + n_outer) + tid] = acc;
   }
 };
 
 class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
+  virtual Type A_type() const override { return Type::FP32; }
+  virtual Type B_type() const override { return Type::FP32; }
+  virtual Type C_type() const override { return Type::FP32; }
   virtual int M_tile() const override { return 32; }
   virtual int N_tile() const override { return 32; }
   virtual int K_tile() const override { return 4; }
@@ -706,8 +836,8 @@ class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const float *A_data, const float *B_data,
-                             float *C_data, int N_outer, int K_outer) {
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -721,8 +851,10 @@ class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
     constexpr int A_tile_size = 32 * 4;
     constexpr int B_tile_size = 32 * 4;
 
-    const float *A_global = A_data + m_outer * K_outer * A_tile_size;
-    const float *B_global = B_data + n_outer * K_outer * B_tile_size;
+    const float *A_global =
+        static_cast<const float *>(A_data) + m_outer * K_outer * A_tile_size;
+    const float *B_global =
+        static_cast<const float *>(B_data) + n_outer * K_outer * B_tile_size;
 
     constexpr int K_outer_shared_size = 4; // Tuned.
 
@@ -799,8 +931,8 @@ class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
       __syncthreads();
     }
 
-    reinterpret_cast<floatx4_t *>(
-        C_data + 1024 * (N_outer * m_outer + n_outer))[tid] = acc;
+    static_cast<floatx4_t *>(
+        C_data)[256 * (N_outer * m_outer + n_outer) + tid] = acc;
   }
 };
 
@@ -808,6 +940,9 @@ template <int MS, int NS>
 class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB
     : public MmtKernel {
   static_assert(NS >= 4 && !(NS % 4));
+  virtual Type A_type() const override { return Type::FP32; }
+  virtual Type B_type() const override { return Type::FP32; }
+  virtual Type C_type() const override { return Type::FP32; }
   virtual int M_tile() const override { return MS * 16; }
   virtual int N_tile() const override { return NS * 16; }
   virtual int K_tile() const override { return 4; }
@@ -836,8 +971,8 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const float *A_data, const float *B_data,
-                             float *C_data, int N_outer, int K_outer) {
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc[MS][NS / 4] = {{0}};
 
@@ -848,8 +983,10 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB
     constexpr int A_tile_size = MS * 16 * 4;
     constexpr int B_tile_size = NS * 16 * 4;
 
-    const float *A_global = A_data + m_outer * K_outer * A_tile_size;
-    const float *B_global = B_data + n_outer * K_outer * B_tile_size;
+    const float *A_global =
+        static_cast<const float *>(A_data) + m_outer * K_outer * A_tile_size;
+    const float *B_global =
+        static_cast<const float *>(B_data) + n_outer * K_outer * B_tile_size;
 
     constexpr int K_outer_shared_size = 4; // Tuned.
 
@@ -927,11 +1064,11 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB
       __syncthreads();
     }
 
-    float *C_ptr = C_data + MS * NS * 16 * 16 * (N_outer * m_outer + n_outer);
+    floatx4_t *C_ptr = static_cast<floatx4_t *>(C_data) +
+                       MS * NS * 16 * 4 * (N_outer * m_outer + n_outer);
     for (int i = 0; i < MS; ++i) {
       for (int j = 0; j < NS / 4; ++j) {
-        reinterpret_cast<floatx4_t *>(
-            C_ptr + 16 * 16 * 4 * (NS / 4 * i + j))[tid] = acc[i][j];
+        C_ptr[16 * 16 * (NS / 4 * i + j) + tid] = acc[i][j];
       }
     }
   }
@@ -940,6 +1077,9 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB
 template <int MS, int NS>
 class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
   static_assert(NS >= 4 && !(NS % 4));
+  virtual Type A_type() const override { return Type::FP32; }
+  virtual Type B_type() const override { return Type::FP32; }
+  virtual Type C_type() const override { return Type::FP32; }
   virtual int M_tile() const override { return MS * 16; }
   virtual int N_tile() const override { return NS * 16; }
   virtual int K_tile() const override { return 4; }
@@ -968,8 +1108,8 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const float *A_data, const float *B_data,
-                             float *C_data, int N_outer, int K_outer) {
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc[MS][NS / 4] = {{0}};
 
@@ -980,8 +1120,10 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
     constexpr int A_tile_size = MS * 16 * 4;
     constexpr int B_tile_size = NS * 16 * 4;
 
-    const float *A_global = A_data + m_outer * K_outer * A_tile_size;
-    const float *B_global = B_data + n_outer * K_outer * B_tile_size;
+    const float *A_global =
+        static_cast<const float *>(A_data) + m_outer * K_outer * A_tile_size;
+    const float *B_global =
+        static_cast<const float *>(B_data) + n_outer * K_outer * B_tile_size;
 
     constexpr int K_outer_shared_size = 4; // Tuned.
 
@@ -1074,11 +1216,11 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
       __syncthreads();
     }
 
-    float *C_ptr = C_data + MS * NS * 16 * 16 * (N_outer * m_outer + n_outer);
+    floatx4_t *C_ptr = static_cast<floatx4_t *>(C_data) +
+                       MS * NS * 16 * 4 * (N_outer * m_outer + n_outer);
     for (int i = 0; i < MS; ++i) {
       for (int j = 0; j < NS / 4; ++j) {
-        reinterpret_cast<floatx4_t *>(
-            C_ptr + 16 * 16 * 4 * (NS / 4 * i + j))[tid] = acc[i][j];
+        C_ptr[16 * 16 * (NS / 4 * i + j) + tid] = acc[i][j];
       }
     }
   }
@@ -1087,6 +1229,9 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
 template <int MS, int NS>
 class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4 : public MmtKernel {
   static_assert(NS >= 4 && !(NS % 4));
+  virtual Type A_type() const override { return Type::FP32; }
+  virtual Type B_type() const override { return Type::FP32; }
+  virtual Type C_type() const override { return Type::FP32; }
   virtual int M_tile() const override { return MS * 16; }
   virtual int N_tile() const override { return NS * 16; }
   virtual int K_tile() const override { return 16; }
@@ -1115,8 +1260,8 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4 : public MmtKernel {
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const float *A_data, const float *B_data,
-                             float *C_data, int N_outer, int K_outer) {
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc[MS][NS / 4] = {{0}};
 
@@ -1127,9 +1272,9 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4 : public MmtKernel {
     constexpr int A_tile_size_in_vec4 = MS * 16 * 4;
     constexpr int B_tile_size_in_vec4 = NS * 16 * 4;
 
-    const floatx4_t *A_global = reinterpret_cast<const floatx4_t *>(A_data) +
+    const floatx4_t *A_global = static_cast<const floatx4_t *>(A_data) +
                                 m_outer * K_outer * A_tile_size_in_vec4;
-    const floatx4_t *B_global = reinterpret_cast<const floatx4_t *>(B_data) +
+    const floatx4_t *B_global = static_cast<const floatx4_t *>(B_data) +
                                 n_outer * K_outer * B_tile_size_in_vec4;
     const floatx4_t *A_global_ptr = A_global + tid;
     const floatx4_t *B_global_ptr = B_global + tid;
@@ -1160,11 +1305,11 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4 : public MmtKernel {
       __syncthreads();
     }
 
-    float *C_ptr = C_data + MS * NS * 16 * 16 * (N_outer * m_outer + n_outer);
+    floatx4_t *C_ptr = static_cast<floatx4_t *>(C_data) +
+                       MS * NS * 16 * 4 * (N_outer * m_outer + n_outer);
     for (int i = 0; i < MS; ++i) {
       for (int j = 0; j < NS / 4; ++j) {
-        reinterpret_cast<floatx4_t *>(
-            C_ptr + 16 * 16 * 4 * (NS / 4 * i + j))[tid] = acc[i][j];
+        C_ptr[16 * 16 * (NS / 4 * i + j) + tid] = acc[i][j];
       }
     }
   }
@@ -1174,6 +1319,9 @@ template <int MS, int NS>
 class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_nobankconflicts
     : public MmtKernel {
   static_assert(NS >= 4 && !(NS % 4));
+  virtual Type A_type() const override { return Type::FP32; }
+  virtual Type B_type() const override { return Type::FP32; }
+  virtual Type C_type() const override { return Type::FP32; }
   virtual int M_tile() const override { return MS * 16; }
   virtual int N_tile() const override { return NS * 16; }
   virtual int K_tile() const override { return 16; }
@@ -1202,8 +1350,8 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_nobankconflicts
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const float *A_data, const float *B_data,
-                             float *C_data, int N_outer, int K_outer) {
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int N_outer, int K_outer) {
     using floatx2_t = __attribute__((__vector_size__(2 * sizeof(float)))) float;
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc[MS][NS / 4] = {{0}};
@@ -1215,9 +1363,9 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_nobankconflicts
     constexpr int A_tile_size_in_vec2 = MS * 16 * 4 * 2;
     constexpr int B_tile_size_in_vec2 = NS * 16 * 4 * 2;
 
-    const floatx2_t *A_global = reinterpret_cast<const floatx2_t *>(A_data) +
+    const floatx2_t *A_global = static_cast<const floatx2_t *>(A_data) +
                                 m_outer * K_outer * A_tile_size_in_vec2;
-    const floatx2_t *B_global = reinterpret_cast<const floatx2_t *>(B_data) +
+    const floatx2_t *B_global = static_cast<const floatx2_t *>(B_data) +
                                 n_outer * K_outer * B_tile_size_in_vec2;
     const floatx2_t *A_global_ptr = A_global + 2 * tid;
     const floatx2_t *B_global_ptr = B_global + 2 * tid;
@@ -1256,11 +1404,11 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_nobankconflicts
       __syncthreads();
     }
 
-    float *C_ptr = C_data + MS * NS * 16 * 16 * (N_outer * m_outer + n_outer);
+    floatx4_t *C_ptr = static_cast<floatx4_t *>(C_data) +
+                       MS * NS * 16 * 4 * (N_outer * m_outer + n_outer);
     for (int i = 0; i < MS; ++i) {
       for (int j = 0; j < NS / 4; ++j) {
-        reinterpret_cast<floatx4_t *>(
-            C_ptr + 16 * 16 * 4 * (NS / 4 * i + j))[tid] = acc[i][j];
+        C_ptr[16 * 16 * (NS / 4 * i + j) + tid] = acc[i][j];
       }
     }
   }

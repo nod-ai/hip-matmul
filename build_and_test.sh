@@ -9,6 +9,6 @@ fi
 
 executable=build/hip-matmul
 
-hipcc matmul.hip -std=c++17 -Wall -Wextra -O3 -o "${executable}" -save-temps=obj
+hipcc matmul.hip -std=c++20 -Wall -Wextra -O3 -o "${executable}" -save-temps=obj
 
 "${executable}"

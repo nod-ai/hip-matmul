@@ -321,7 +321,8 @@ void benchmark(const MmtKernel &kernel, const TiledMmtShape &s) {
   HIP_CHECK(hipEventCreate(&stop));
   float batch_ms{};
   float min_batch_ms = getIntEnvVar("BENCHMARK_MIN_MS", 100);
-  int batch_size = 1;
+  int fixed_batch_size = getIntEnvVar("FIXED_BATCH_SIZE", 0);
+  int batch_size = fixed_batch_size ? fixed_batch_size : 1;
   while (true) {
     HIP_CHECK(hipEventRecord(start, hipStreamDefault));
     for (int b = 0; b < batch_size; ++b) {
@@ -333,7 +334,7 @@ void benchmark(const MmtKernel &kernel, const TiledMmtShape &s) {
     HIP_CHECK(hipEventRecord(stop, hipStreamDefault));
     HIP_CHECK(hipEventSynchronize(stop));
     HIP_CHECK(hipEventElapsedTime(&batch_ms, start, stop));
-    if (batch_ms >= min_batch_ms) {
+    if (batch_ms >= min_batch_ms || fixed_batch_size) {
       break;
     }
     if (batch_size > (1 << 20)) {
@@ -351,8 +352,8 @@ void benchmark(const MmtKernel &kernel, const TiledMmtShape &s) {
                             s.K_tile;
   float kernel_ops_per_s = 1000.f * kernel_ops / kernel_ms;
   float kernel_bytes_read_per_s = 1000.f * kernel_bytes_read / kernel_ms;
-  printf("%.3g Tflop/s, read %.3g TB/s\n", 1.e-12f * kernel_ops_per_s,
-         1e-12f * kernel_bytes_read_per_s);
+  printf("%.3g Tflop/s, read %.3g TB/s, batch_size=%d\n", 1.e-12f * kernel_ops_per_s,
+         1e-12f * kernel_bytes_read_per_s, batch_size);
 
   HIP_CHECK(hipEventDestroy(start));
   HIP_CHECK(hipEventDestroy(stop));

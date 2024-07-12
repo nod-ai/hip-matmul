@@ -66,6 +66,21 @@ __device__ __host__ int offset(const TiledMatrixShape &s, int r_outer,
 
 enum class Type { SI8, SI16, SI32, FP16, FP32 };
 
+const char *str(Type t) {
+  switch (t) {
+  case Type::SI8:
+    return "si8";
+  case Type::SI16:
+    return "si16";
+  case Type::SI32:
+    return "si32";
+  case Type::FP16:
+    return "fp16";
+  case Type::FP32:
+    return "fp32";
+  }
+}
+
 int type_size(Type t) {
   switch (t) {
   case Type::SI8:
@@ -183,7 +198,7 @@ void checkMmtResults(Type A_type, Type B_type, Type C_type,
     return;                                                                    \
   }
   HANDLE_CASE(FP32, FP32, FP32)
-  HANDLE_CASE(FP16, FP16, FP16)
+  HANDLE_CASE(FP16, FP16, FP32)
   HANDLE_CASE(SI8, SI8, SI32)
 #undef HANDLE_CASE
 
@@ -355,7 +370,9 @@ void test(const MmtKernel &kernel) {
     return;
   }
   TiledMmtShape s = getTestShape(kernel);
-  printf("%s: MxNxK outer=(%dx%dx%d) tile=(%dx%dx%d) num_threads=%d\n", name,
+  printf("%s: A:%s, B:%s, C:%s, MxNxK: outer=(%dx%dx%d), tile=(%dx%dx%d), "
+         "num_threads=%d\n",
+         name, str(kernel.A_type()), str(kernel.B_type()), str(kernel.C_type()),
          s.M_outer, s.N_outer, s.K_outer, s.M_tile, s.N_tile, s.K_tile,
          kernel.num_threads());
   free(name);
@@ -377,11 +394,12 @@ void test(const MmtKernel &kernel) {
   benchmark(kernel, s);
 }
 
-template <int T_M_tile, int T_N_tile, int T_K_tile>
+template <Type T_A_type, Type T_B_type, Type T_C_type, int T_M_tile,
+          int T_N_tile, int T_K_tile>
 class MmtKernel_generic : public MmtKernel {
-  virtual Type A_type() const override { return Type::FP32; }
-  virtual Type B_type() const override { return Type::FP32; }
-  virtual Type C_type() const override { return Type::FP32; }
+  virtual Type A_type() const override { return T_A_type; }
+  virtual Type B_type() const override { return T_B_type; }
+  virtual Type C_type() const override { return T_C_type; }
   virtual int M_tile() const override { return T_M_tile; }
   virtual int N_tile() const override { return T_N_tile; }
   virtual int K_tile() const override { return T_K_tile; }
@@ -398,6 +416,9 @@ class MmtKernel_generic : public MmtKernel {
   virtual mmt_func_t mmt_func() const override { return run; };
   __global__ static void run(const void *A_data, const void *B_data,
                              void *C_data, int N_outer, int K_outer) {
+    using TA = CType<T_A_type>;
+    using TB = CType<T_B_type>;
+    using TC = CType<T_C_type>;
     int m_outer = blockIdx.x;
     int n_outer = blockIdx.y;
     int m_tile = threadIdx.x / T_N_tile;
@@ -405,18 +426,18 @@ class MmtKernel_generic : public MmtKernel {
     float c = 0.f;
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       for (int k_tile = 0; k_tile < T_K_tile; ++k_tile) {
-        float a = static_cast<const float *>(
+        float a = static_cast<const TA *>(
             A_data)[k_tile +
                     T_K_tile *
                         (m_tile + T_M_tile * (k_outer + K_outer * m_outer))];
-        float b = static_cast<const float *>(
+        float b = static_cast<const TB *>(
             B_data)[k_tile +
                     T_K_tile *
                         (n_tile + T_N_tile * (k_outer + K_outer * n_outer))];
         c += a * b;
       }
     }
-    static_cast<float *>(
+    static_cast<TC *>(
         C_data)[n_tile + T_N_tile * (m_tile + T_M_tile * (n_outer +
                                                           N_outer * m_outer))] =
         c;
@@ -1415,7 +1436,9 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_nobankconflicts
 };
 
 int main() {
-  test(MmtKernel_generic<3, 5, 2>());
+  test(MmtKernel_generic<Type::FP32, Type::FP32, Type::FP32, 3, 5, 2>());
+  test(MmtKernel_generic<Type::FP16, Type::FP16, Type::FP32, 3, 5, 2>());
+  test(MmtKernel_generic<Type::SI8, Type::SI8, Type::SI32, 3, 5, 2>());
   test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_rowmajor());
   test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC());
   test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct());

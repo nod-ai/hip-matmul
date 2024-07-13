@@ -12,7 +12,7 @@ omniperf profile \
 profile_path="workloads/$profile_name"
 
 some_profile_file="$(find "$profile_path" -name pmc_perf.csv)"
-profile_files_path="$(basename "$some_profile_file")"
+profile_files_path="$(dirname "$some_profile_file")"
 analysis_path="${profile_path}/analysis.txt"
 
 omniperf analyze -q -p "${profile_files_path}" > "$analysis_path"

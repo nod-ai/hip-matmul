@@ -1462,4 +1462,5 @@ int main() {
   test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<8, 12>());
   test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<8, 12>());
   test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 12>());
+  test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<16, 16>());
 }

@@ -97,21 +97,11 @@ int type_size(Type t) {
 }
 
 template <Type t> struct CTypeImpl {};
-template <> struct CTypeImpl<Type::SI8> {
-  using type = int8_t;
-};
-template <> struct CTypeImpl<Type::SI16> {
-  using type = int16_t;
-};
-template <> struct CTypeImpl<Type::SI32> {
-  using type = int32_t;
-};
-template <> struct CTypeImpl<Type::FP16> {
-  using type = __fp16;
-};
-template <> struct CTypeImpl<Type::FP32> {
-  using type = float;
-};
+template <> struct CTypeImpl<Type::SI8> { using type = int8_t; };
+template <> struct CTypeImpl<Type::SI16> { using type = int16_t; };
+template <> struct CTypeImpl<Type::SI32> { using type = int32_t; };
+template <> struct CTypeImpl<Type::FP16> { using type = __fp16; };
+template <> struct CTypeImpl<Type::FP32> { using type = float; };
 template <Type t> using CType = CTypeImpl<t>::type;
 
 template <Type type>
@@ -352,8 +342,9 @@ void benchmark(const MmtKernel &kernel, const TiledMmtShape &s) {
                             s.K_tile;
   float kernel_ops_per_s = 1000.f * kernel_ops / kernel_ms;
   float kernel_bytes_read_per_s = 1000.f * kernel_bytes_read / kernel_ms;
-  printf("%.3g Tflop/s, read %.3g TB/s, batch_size=%d\n", 1.e-12f * kernel_ops_per_s,
-         1e-12f * kernel_bytes_read_per_s, batch_size);
+  printf("%.3g Tflop/s, read %.3g TB/s, batch_size=%d\n",
+         1.e-12f * kernel_ops_per_s, 1e-12f * kernel_bytes_read_per_s,
+         batch_size);
 
   HIP_CHECK(hipEventDestroy(start));
   HIP_CHECK(hipEventDestroy(stop));
@@ -445,7 +436,7 @@ class MmtKernel_generic : public MmtKernel {
   }
 };
 
-class MmtKernel_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MmtKernel {
+class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MmtKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -463,8 +454,10 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MmtKernel {
   }
   virtual int num_threads() const override { return 64; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const void *A_data, const void *B_data,
-                             void *C_data, int N_outer, int K_outer) {
+  __global__ __launch_bounds__(64) static void run(const void *A_data,
+                                                   const void *B_data,
+                                                   void *C_data, int N_outer,
+                                                   int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -497,7 +490,7 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MmtKernel {
   }
 };
 
-class MmtKernel_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC
+class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC
     : public MmtKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
@@ -516,8 +509,10 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC
   }
   virtual int num_threads() const override { return 64; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const void *A_data, const void *B_data,
-                             void *C_data, int N_outer, int K_outer) {
+  __global__ __launch_bounds__(64) static void run(const void *A_data,
+                                                   const void *B_data,
+                                                   void *C_data, int N_outer,
+                                                   int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -546,7 +541,7 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC
   }
 };
 
-class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
+class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -564,8 +559,10 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   }
   virtual int num_threads() const override { return 64; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const void *A_data, const void *B_data,
-                             void *C_data, int N_outer, int K_outer) {
+  __global__ __launch_bounds__(64) static void run(const void *A_data,
+                                                   const void *B_data,
+                                                   void *C_data, int N_outer,
+                                                   int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -589,7 +586,7 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   }
 };
 
-class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct_Kx4 : public MmtKernel {
+class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4 : public MmtKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -607,8 +604,10 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct_Kx4 : public MmtKernel {
   }
   virtual int num_threads() const override { return 64; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const void *A_data, const void *B_data,
-                             void *C_data, int N_outer, int K_outer) {
+  __global__ __launch_bounds__(64) static void run(const void *A_data,
+                                                   const void *B_data,
+                                                   void *C_data, int N_outer,
+                                                   int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -639,7 +638,7 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct_Kx4 : public MmtKernel {
   }
 };
 
-class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4
+class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4
     : public MmtKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
@@ -658,8 +657,10 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4
   }
   virtual int num_threads() const override { return 64; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const void *A_data, const void *B_data,
-                             void *C_data, int N_outer, int K_outer) {
+  __global__ __launch_bounds__(64) static void run(const void *A_data,
+                                                   const void *B_data,
+                                                   void *C_data, int N_outer,
+                                                   int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -717,7 +718,7 @@ class MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4
   }
 };
 
-class MmtKernel_1x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
+class MmtKernel_128t_1x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -743,8 +744,10 @@ class MmtKernel_1x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   }
   virtual int num_threads() const override { return 128; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const void *A_data, const void *B_data,
-                             void *C_data, int N_outer, int K_outer) {
+  __global__ __launch_bounds__(128) static void run(const void *A_data,
+                                                    const void *B_data,
+                                                    void *C_data, int N_outer,
+                                                    int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -768,7 +771,7 @@ class MmtKernel_1x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   }
 };
 
-class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
+class MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -800,8 +803,10 @@ class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const void *A_data, const void *B_data,
-                             void *C_data, int N_outer, int K_outer) {
+  __global__ __launch_bounds__(256) static void run(const void *A_data,
+                                                    const void *B_data,
+                                                    void *C_data, int N_outer,
+                                                    int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -826,7 +831,7 @@ class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   }
 };
 
-class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
+class MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -858,8 +863,10 @@ class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const void *A_data, const void *B_data,
-                             void *C_data, int N_outer, int K_outer) {
+  __global__ __launch_bounds__(256) static void run(const void *A_data,
+                                                    const void *B_data,
+                                                    void *C_data, int N_outer,
+                                                    int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -959,8 +966,9 @@ class MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
 };
 
 template <int MS, int NS>
-class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB
+class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB
     : public MmtKernel {
+  static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
@@ -993,8 +1001,10 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const void *A_data, const void *B_data,
-                             void *C_data, int N_outer, int K_outer) {
+  __global__ __launch_bounds__(256) static void run(const void *A_data,
+                                                    const void *B_data,
+                                                    void *C_data, int N_outer,
+                                                    int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc[MS][NS / 4] = {{0}};
 
@@ -1097,7 +1107,9 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB
 };
 
 template <int MS, int NS>
-class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
+class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared
+    : public MmtKernel {
+  static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
@@ -1130,8 +1142,10 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const void *A_data, const void *B_data,
-                             void *C_data, int N_outer, int K_outer) {
+  __global__ __launch_bounds__(256) static void run(const void *A_data,
+                                                    const void *B_data,
+                                                    void *C_data, int N_outer,
+                                                    int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc[MS][NS / 4] = {{0}};
 
@@ -1249,7 +1263,9 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
 };
 
 template <int MS, int NS>
-class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4 : public MmtKernel {
+class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4
+    : public MmtKernel {
+  static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
@@ -1282,8 +1298,10 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4 : public MmtKernel {
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const void *A_data, const void *B_data,
-                             void *C_data, int N_outer, int K_outer) {
+  __global__ __launch_bounds__(256) static void run(const void *A_data,
+                                                    const void *B_data,
+                                                    void *C_data, int N_outer,
+                                                    int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc[MS][NS / 4] = {{0}};
 
@@ -1331,14 +1349,113 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4 : public MmtKernel {
                        MS * NS * 16 * 4 * (N_outer * m_outer + n_outer);
     for (int i = 0; i < MS; ++i) {
       for (int j = 0; j < NS / 4; ++j) {
-        C_ptr[16 * 16 * (NS / 4 * i + j) + tid] = acc[i][j];
+        C_ptr[256 * (NS / 4 * i + j) + tid] = acc[i][j];
       }
     }
   }
 };
 
 template <int MS, int NS>
-class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_nobankconflicts
+class MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4
+    : public MmtKernel {
+  static_assert(MS >= 4 && !(MS % 4));
+  static_assert(NS >= 4 && !(NS % 4));
+  virtual Type A_type() const override { return Type::FP32; }
+  virtual Type B_type() const override { return Type::FP32; }
+  virtual Type C_type() const override { return Type::FP32; }
+  virtual int M_tile() const override { return MS * 16; }
+  virtual int N_tile() const override { return NS * 16; }
+  virtual int K_tile() const override { return 16; }
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) {
+      int mi = m % 16;
+      int mo = m / 16;
+      return k / 4 + 4 * (64 * mo + 16 * (k % 4) + mi);
+    };
+  }
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) {
+      int ni = n % 16;
+      int no = n / 16;
+      return k / 4 + 4 * (64 * no + 16 * (k % 4) + ni);
+    };
+  }
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) {
+      int mi = m % 16;
+      int mo = (m % 64) / 16;
+      int mx = m / 64;
+      int ni = n % 16;
+      int no = (n % 64) / 16;
+      int nx = n / 64;
+      return (NS / 4) * 4096 * mx + 4096 * nx + 1024 * mo + 256 * no +
+             64 * (mi / 4) + 4 * ni + (mi % 4);
+    };
+  }
+  virtual int num_threads() const override { return 1024; }
+  virtual mmt_func_t mmt_func() const override { return run; };
+  __global__ __launch_bounds__(1024) static void run(const void *A_data,
+                                                     const void *B_data,
+                                                     void *C_data, int N_outer,
+                                                     int K_outer) {
+    using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+    floatx4_t acc[MS / 4][NS / 4] = {{0}};
+
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int tid = threadIdx.x;
+
+    constexpr int A_tile_size_in_vec4 = MS * 16 * 4;
+    constexpr int B_tile_size_in_vec4 = NS * 16 * 4;
+
+    const floatx4_t *A_global = static_cast<const floatx4_t *>(A_data) +
+                                m_outer * K_outer * A_tile_size_in_vec4;
+    const floatx4_t *B_global = static_cast<const floatx4_t *>(B_data) +
+                                n_outer * K_outer * B_tile_size_in_vec4;
+    const floatx4_t *A_global_ptr = A_global + tid;
+    const floatx4_t *B_global_ptr = B_global + tid;
+
+    __shared__ floatx4_t A_shared[A_tile_size_in_vec4];
+    __shared__ floatx4_t B_shared[B_tile_size_in_vec4];
+
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      for (int i = 0; i < A_tile_size_in_vec4; i += 1024) {
+        if (tid < MS * 64)
+          A_shared[i + tid] = A_global_ptr[i];
+      }
+      for (int j = 0; j < B_tile_size_in_vec4; j += 1024) {
+        if (tid < NS * 64)
+          B_shared[j + tid] = B_global_ptr[j];
+      }
+      A_global_ptr += A_tile_size_in_vec4;
+      B_global_ptr += B_tile_size_in_vec4;
+      __syncthreads();
+
+      for (int k = 0; k < 4; ++k) {
+        for (int i = 0; i < MS / 4; ++i) {
+          for (int j = 0; j < NS / 4; ++j) {
+            acc[i][j] = __builtin_amdgcn_mfma_f32_16x16x4f32(
+                A_shared[256 * i + 64 * (tid / 256) + (tid % 64)][k],
+                B_shared[256 * j + (tid % 256)][k], acc[i][j], 0, 0, 0);
+          }
+        }
+      }
+      __syncthreads();
+    }
+
+    floatx4_t *C_ptr = static_cast<floatx4_t *>(C_data) +
+                       MS * NS * 16 * 4 * (N_outer * m_outer + n_outer);
+    for (int i = 0; i < MS / 4; ++i) {
+      for (int j = 0; j < NS / 4; ++j) {
+        C_ptr[1024 * (NS / 4 * i + j) + tid] = acc[i][j];
+      }
+    }
+  }
+};
+
+template <int MS, int NS>
+class
+    MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_misguidednobankconflicts
     : public MmtKernel {
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
@@ -1372,8 +1489,10 @@ class MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_nobankconflicts
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ static void run(const void *A_data, const void *B_data,
-                             void *C_data, int N_outer, int K_outer) {
+  __global__ __launch_bounds__(256) static void run(const void *A_data,
+                                                    const void *B_data,
+                                                    void *C_data, int N_outer,
+                                                    int K_outer) {
     using floatx2_t = __attribute__((__vector_size__(2 * sizeof(float)))) float;
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc[MS][NS / 4] = {{0}};
@@ -1440,27 +1559,34 @@ int main() {
   test(MmtKernel_generic<Type::FP32, Type::FP32, Type::FP32, 3, 5, 2>());
   test(MmtKernel_generic<Type::FP16, Type::FP16, Type::FP32, 3, 5, 2>());
   test(MmtKernel_generic<Type::SI8, Type::SI8, Type::SI32, 3, 5, 2>());
-  test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_rowmajor());
-  test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC());
-  test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct());
-  test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct_Kx4());
-  test(MmtKernel_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4());
-  test(MmtKernel_1x2_amdgcn_mfma_f32_16x16x4f32_direct());
-  test(MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_direct());
-  test(MmtKernel_2x2_amdgcn_mfma_f32_16x16x4f32_shared());
-  test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<4, 4>());
-  test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<4, 4>());
-  test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<4, 4>());
-  test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<4, 8>());
-  test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<4, 8>());
-  test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<4, 8>());
-  test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<8, 8>());
-  test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<8, 8>());
-  test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_nobankconflicts<
-       8, 8>());
-  test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 8>());
-  test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<8, 12>());
-  test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<8, 12>());
-  test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 12>());
-  test(MmtKernel_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<16, 16>());
+  test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_rowmajor());
+  test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC());
+  test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct());
+  test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4());
+  test(MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4());
+  test(MmtKernel_128t_1x2_amdgcn_mfma_f32_16x16x4f32_direct());
+  test(MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_direct());
+  test(MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_shared());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<4, 4>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<4, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<8, 8>());
+  test(
+      MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB<8, 12>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<4, 4>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<4, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<8, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared<8, 12>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<4, 4>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<4, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 12>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 16>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<16, 16>());
+  test(
+      MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_misguidednobankconflicts<
+          8, 8>());
+  test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 8>());
+  test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 12>());
+  test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 16>());
+  test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<16, 16>());
 }

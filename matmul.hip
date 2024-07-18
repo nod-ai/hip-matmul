@@ -1870,7 +1870,6 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared
               0, 0, 0);
         }
       }
-      __syncthreads();
     }
 
     floatx4_t *C_ptr = static_cast<floatx4_t *>(C_data) +

@@ -6,6 +6,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstdio>
 #include <cxxabi.h>
 #include <functional>
 #include <random>
@@ -102,7 +103,7 @@ template <> struct CTypeImpl<Type::SI16> { using type = int16_t; };
 template <> struct CTypeImpl<Type::SI32> { using type = int32_t; };
 template <> struct CTypeImpl<Type::FP16> { using type = _Float16; };
 template <> struct CTypeImpl<Type::FP32> { using type = float; };
-template <Type t> using CType = CTypeImpl<t>::type;
+template <Type t> using CType = typename CTypeImpl<t>::type;
 
 template <Type type>
 void fillRandomBuffer(int size, std::minstd_rand &r, void *out_buffer) {
@@ -167,9 +168,10 @@ void checkMmtResults(const void *A_data_void, const void *B_data_void,
             fprintf(stderr,
                     "matmul numerical error: actual(%g) != "
                     "expected(%g), at m_outer=%d n_outer=%d m_tile=%d "
-                    "n_tile=%d, at %s:%d\n",
+                    "n_tile=%d, at %s:%d. Note: outer MxNxK = %dx%dx%d\n",
                     static_cast<float>(actual), static_cast<float>(expected),
-                    m_outer, n_outer, m_tile, n_tile, __FILE__, __LINE__);
+                    m_outer, n_outer, m_tile, n_tile, __FILE__, __LINE__,
+                    s.M_outer, s.N_outer, s.K_outer);
             abort();
           }
         }
@@ -214,14 +216,26 @@ public:
   virtual mmt_func_t mmt_func() const = 0;
 };
 
-TiledMmtShape getTestShape(const MmtKernel &kernel) {
+struct OuterShape {
+  int m, n, k;
+};
+
+OuterShape getBenchmarkOuterShape(const MmtKernel &kernel) {
   int M = getIntEnvVar("M", 4096);
   int N = getIntEnvVar("N", 4096);
   int K = getIntEnvVar("K", 4096);
+  OuterShape o;
+  o.m = std::max(1, M / kernel.M_tile());
+  o.n = std::max(1, N / kernel.N_tile());
+  o.k = std::max(1, K / kernel.K_tile());
+  return o;
+}
+
+TiledMmtShape getTestShape(const MmtKernel &kernel, const OuterShape &o) {
   TiledMmtShape s;
-  s.M_outer = std::max(1, M / kernel.M_tile());
-  s.N_outer = std::max(1, N / kernel.N_tile());
-  s.K_outer = std::max(1, K / kernel.K_tile());
+  s.M_outer = o.m;
+  s.N_outer = o.n;
+  s.K_outer = o.k;
   s.M_tile = kernel.M_tile();
   s.N_tile = kernel.N_tile();
   s.K_tile = kernel.K_tile();
@@ -231,7 +245,8 @@ TiledMmtShape getTestShape(const MmtKernel &kernel) {
   return s;
 }
 
-void check(const MmtKernel &kernel, const TiledMmtShape &s) {
+void check(const MmtKernel &kernel, const OuterShape &o) {
+  TiledMmtShape s = getTestShape(kernel, o);
   std::minstd_rand random_engine;
   std::vector<std::byte> A_host_data =
       makeRandomBuffer(kernel.A_type(), flatsize(A_shape(s)), random_engine);
@@ -276,7 +291,25 @@ void check(const MmtKernel &kernel, const TiledMmtShape &s) {
   HIP_CHECK(hipFree(shape_device_buffer));
 }
 
-void benchmark(const MmtKernel &kernel, const TiledMmtShape &s) {
+void check(const MmtKernel &kernel) {
+  std::printf("  Checking correctness... ");
+  // Test with more generic shapes than just M==N==K==2^x.
+  for (OuterShape o :
+       {OuterShape{1, 1, 1}, OuterShape{2, 1, 1}, OuterShape{1, 2, 1},
+        OuterShape{1, 1, 2}, OuterShape{1, 1, 3}, OuterShape{1, 1, 4},
+        OuterShape{1, 1, 5}, OuterShape{2, 2, 2}, OuterShape{2, 3, 4},
+        OuterShape{5, 2, 3}}) {
+    check(kernel, o);
+  }
+  std::printf("OK\n");
+}
+
+void benchmark(const MmtKernel &kernel, const OuterShape &o) {
+  TiledMmtShape s = getTestShape(kernel, o);
+  std::printf("  Benchmarking: total MxNxK=%dx%dx%d, outer MxNxK=%dx%dx%d ... ",
+              s.M_outer * s.M_tile, s.N_outer * s.N_tile, s.K_outer * s.K_tile,
+              s.M_outer, s.N_outer, s.K_outer);
+
   std::minstd_rand random_engine;
   std::vector<std::byte> A_host_data =
       makeRandomBuffer(kernel.A_type(), flatsize(A_shape(s)), random_engine);
@@ -342,9 +375,9 @@ void benchmark(const MmtKernel &kernel, const TiledMmtShape &s) {
                             s.K_tile;
   float kernel_ops_per_s = 1000.f * kernel_ops / kernel_ms;
   float kernel_bytes_read_per_s = 1000.f * kernel_bytes_read / kernel_ms;
-  printf("%.3g Tflop/s, read %.3g TB/s, batch_size=%d\n",
-         1.e-12f * kernel_ops_per_s, 1e-12f * kernel_bytes_read_per_s,
-         batch_size);
+  std::printf("%.3g Tflop/s, read %.3g TB/s, batch_size=%d\n",
+              1.e-12f * kernel_ops_per_s, 1e-12f * kernel_bytes_read_per_s,
+              batch_size);
 
   HIP_CHECK(hipEventDestroy(start));
   HIP_CHECK(hipEventDestroy(stop));
@@ -361,30 +394,18 @@ void test(const MmtKernel &kernel) {
   if (filter && !strstr(name, filter)) {
     return;
   }
-  TiledMmtShape s = getTestShape(kernel);
-  printf("%s: A:%s, B:%s, C:%s, MxNxK: outer=(%dx%dx%d), tile=(%dx%dx%d), "
-         "num_threads=%d\n",
-         name, str(kernel.A_type()), str(kernel.B_type()), str(kernel.C_type()),
-         s.M_outer, s.N_outer, s.K_outer, s.M_tile, s.N_tile, s.K_tile,
-         kernel.num_threads());
+  std::printf("%s: A:%s, B:%s, C:%s, tile MxNxK=%dx%dx%d, num_threads=%d\n",
+              name, str(kernel.A_type()), str(kernel.B_type()),
+              str(kernel.C_type()), kernel.M_tile(), kernel.N_tile(),
+              kernel.K_tile(), kernel.num_threads());
   free(name);
 
   if (!getenv("SKIP_CHECK")) {
-    printf("  Checking correctness... ");
-    // Test with more generic shapes than just M==N==K==2^x.
-    TiledMmtShape s_tweaked{s};
-    s_tweaked.M_outer += 1;
-    s_tweaked.N_outer += 3;
-    check(kernel, s_tweaked);
-    for (int k_tweaked = 1; k_tweaked < 8; ++k_tweaked) {
-      s_tweaked.K_outer = k_tweaked;
-      check(kernel, s_tweaked);
-    }
-    printf("OK\n");
+    check(kernel);
   }
 
-  printf("  Benchmarking... ");
-  benchmark(kernel, s);
+  OuterShape o = getBenchmarkOuterShape(kernel);
+  benchmark(kernel, o);
 }
 
 template <Type T_A_type, Type T_B_type, Type T_C_type, int T_M_tile,

@@ -1,0 +1,2 @@
+--rocm-path=/opt/rocm-6.2.0-14024/
+--std=c++20

@@ -299,7 +299,7 @@ void check(const MmtKernel &kernel) {
         OuterShape{1, 1, 2}, OuterShape{1, 1, 3}, OuterShape{1, 1, 4},
         OuterShape{1, 1, 5}, OuterShape{2, 2, 2}, OuterShape{2, 3, 4},
         OuterShape{5, 2, 3}, OuterShape{1, 1, 10}, OuterShape{4, 4, 8},
-        OuterShape{8, 8, 4}}) {
+        OuterShape{8, 8, 4}, OuterShape{20, 20, 20}}) {
     check(kernel, o);
   }
   std::printf("OK\n");
@@ -376,7 +376,7 @@ void benchmark(const MmtKernel &kernel, const OuterShape &o) {
                             s.K_tile;
   float kernel_ops_per_s = 1000.f * kernel_ops / kernel_ms;
   float kernel_bytes_read_per_s = 1000.f * kernel_bytes_read / kernel_ms;
-  std::printf("%.3g Tflop/s, read %.3g TB/s, iterations=%d\n",
+  std::printf("%.4g Tflop/s, read %.4g TB/s, iterations=%d\n",
               1.e-12f * kernel_ops_per_s, 1e-12f * kernel_bytes_read_per_s,
               iterations);
 
@@ -2286,6 +2286,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload
       for (int k_outer = 0; k_outer < K_outer - 2; ++k_outer) {
         __syncthreads();
         mfma();
+        __syncthreads(); // Why is this needed?
         vpgr0_to_shared();
         global_to_vgpr0();
       }

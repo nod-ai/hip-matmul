@@ -15,6 +15,7 @@
 #include <barrier>
 #include <functional>
 #include <thread>
+#include <cassert>
 
 using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
 
@@ -27,6 +28,7 @@ thread_local int tid;
 // Functionally equivalent to AMDGPU __builtin_amdgcn_mfma_f32_16x16x4f32,
 // just with normal CPU threads instead of GPU threads!
 floatx4_t cpu_mfma_f32_16x16x4f32(float a, float b, floatx4_t c) {
+  assert(tid < threads_per_subgroup && "current limitation: only one subgroup");
   // Each thread is going to need `a` and `b` matrix elements passed to other
   // threads, not just the single ones that were directly passed to it.
   static float a_tile[threads_per_subgroup];

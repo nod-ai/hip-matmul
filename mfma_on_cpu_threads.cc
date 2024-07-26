@@ -27,14 +27,18 @@ thread_local int tid;
 // Functionally equivalent to AMDGPU __builtin_amdgcn_mfma_f32_16x16x4f32,
 // just with normal CPU threads instead of GPU threads!
 floatx4_t cpu_mfma_f32_16x16x4f32(float a, float b, floatx4_t c) {
+  // Each thread is going to need `a` and `b` matrix elements passed to other
+  // threads, not just the single ones that were directly passed to it.
   static float a_tile[threads_per_subgroup];
   static float b_tile[threads_per_subgroup];
+  // Record the single `a` and `b` elements directly passed to us, so other
+  // threads can see them.
   a_tile[tid] = a;
   b_tile[tid] = b;
-  static std::barrier<std::function<void()>> barrier(threads_per_subgroup,
-                                                     []() {});
+  // Wait for all threads to have made their contributions to `{a,b}_tile`.
+  static std::barrier barrier(threads_per_subgroup, []() {});
   barrier.arrive_and_wait();
-
+  // Now perform the computation, now that we can see the whole `{a,b}_tile`.
   int m = 4 * (tid / 16);
   int n = tid % 16;
   for (int k = 0; k < 4; ++k) {

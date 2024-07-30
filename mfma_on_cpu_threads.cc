@@ -38,7 +38,7 @@ floatx4_t cpu_mfma_f32_16x16x4f32(float a, float b, floatx4_t c) {
   a_tile[tid] = a;
   b_tile[tid] = b;
   // Wait for all threads to have made their contributions to `{a,b}_tile`.
-  static std::barrier barrier(threads_per_subgroup, []() {});
+  static std::barrier barrier(threads_per_subgroup);
   barrier.arrive_and_wait();
   // Now perform the computation, now that we can see the whole `{a,b}_tile`.
   int m = 4 * (tid / 16);

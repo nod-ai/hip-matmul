@@ -1892,6 +1892,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared
               0, 0, 0);
         }
       }
+      __syncthreads();
     }
 
     floatx4_t *C_ptr = static_cast<floatx4_t *>(C_data) +
@@ -1993,6 +1994,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
               __builtin_amdgcn_mfma_f32_16x16x16f16(a1, b1, acc[i][j], 0, 0, 0);
         }
       }
+      __syncthreads();
     }
 
     floatx4_t *C_ptr = static_cast<floatx4_t *>(C_data) +
@@ -2085,6 +2087,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_32x32x16i8_shared
               0, 0, 0);
         }
       }
+      __syncthreads();
     }
 
     int32x16_t *C_ptr = static_cast<int32x16_t *>(C_data) +
@@ -2176,6 +2179,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
               0, 0, 0);
         }
       }
+      __syncthreads();
     }
 
     int32x4_t *C_ptr = static_cast<int32x4_t *>(C_data) +
@@ -2271,6 +2275,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2
           }
         }
       }
+      __syncthreads();
     }
 
     int32x4_t *C_ptr = static_cast<int32x4_t *>(C_data) +

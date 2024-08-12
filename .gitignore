@@ -8,3 +8,6 @@
 build
 build-*
 workloads
+.cache
+.vscode
+

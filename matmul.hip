@@ -2390,17 +2390,24 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload
     if (K_outer >= 2) {
       global_to_vgpr0();
       for (int k_outer = 0; k_outer < K_outer - 2; ++k_outer) {
+        // Wait for all shared memory to be written by all subgroups.
         __syncthreads();
         mfma();
-        __syncthreads(); // Why is this needed?
+        // Wait for all subgroups to finish reading from shared memory, so that
+        // we can overwrite it.
+        __syncthreads();
         vpgr0_to_shared();
         global_to_vgpr0();
       }
+      // Wait for all shared memory to be written by all subgroups.
       __syncthreads();
       mfma();
+      // Wait for all subgroups to finish reading from shared memory, so that
+      // we can overwrite it.
       __syncthreads();
       vpgr0_to_shared();
     }
+    // Wait for all shared memory to be written by all subgroups.
     __syncthreads();
     mfma();
 
@@ -2418,7 +2425,7 @@ int main() {
   std::printf("Best-performing kernels for each element types:\n\n");
   test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2<8, 8>());
   test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload<
-       8, 8>());
+       12, 8>());
   test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared<8, 8>());
   test(MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2<8, 8>());
   test(MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4<8, 8>());
@@ -2465,4 +2472,6 @@ int main() {
       MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_doublebuffer_take2<
           8, 8>());
   test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared<8, 8>());
+  test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload<
+       8, 8>());
 }

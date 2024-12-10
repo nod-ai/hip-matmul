@@ -8,6 +8,11 @@
 // performs internal reassociation, by computing a 16x16 matmul and checking
 // the element [0, 0] in the result matrix against a reference implementation
 // not reassociating.
+//
+// Two reference results are computed: using std::fmaf, and using plain add and
+// mul. The results are much closer with std::fmaf, but still not exactly the
+// same. This suggests that the GPU instruction internally really is doing a
+// fused multiply-add, but reassociating.
 
 /* Compile and run:
 
@@ -88,13 +93,22 @@ int main() {
   HIP_CHECK(hipFree(B_device_buffer));
   HIP_CHECK(hipFree(C_device_buffer));
 
-  float reference_C00 = 0.f;
+  float reference_C00_fma = 0.f;
+  float reference_C00_nonfma = 0.f;
   for (int i = 0; i < 16; ++i) {
-    reference_C00 = std::fmaf(A_host_data[row0_layout(i)],
-                              B_host_data[row0_layout(i)], reference_C00);
+    reference_C00_fma =
+        std::fmaf(A_host_data[row0_layout(i)], B_host_data[row0_layout(i)],
+                  reference_C00_fma);
+    reference_C00_nonfma +=
+        A_host_data[row0_layout(i)] * B_host_data[row0_layout(i)];
   }
-  float diff = C_host_data[0] - reference_C00;
-  std::printf("GPU C00:                            %.8g\n", C_host_data[0]);
-  std::printf("Non-reassociating reference C00:    %.8g\n", reference_C00);
-  std::printf("Difference:                         %g\n", diff);
+  std::printf("GPU result:                            %.8g\n", C_host_data[0]);
+  std::printf("Non-reassociating reference (using FMA):    %.8g\n",
+              reference_C00_fma);
+  std::printf("Difference:                         %g\n",
+              C_host_data[0] - reference_C00_fma);
+  std::printf("Non-reassociating reference (not using FMA):    %.8g\n",
+              reference_C00_nonfma);
+  std::printf("Difference:                         %g\n",
+              C_host_data[0] - reference_C00_nonfma);
 }

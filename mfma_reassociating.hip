@@ -102,13 +102,13 @@ int main() {
     reference_C00_nonfma +=
         A_host_data[row0_layout(i)] * B_host_data[row0_layout(i)];
   }
-  std::printf("GPU result:                            %.8g\n", C_host_data[0]);
-  std::printf("Non-reassociating reference (using FMA):    %.8g\n",
+  std::printf("GPU result:                                  %.8g\n", C_host_data[0]);
+  std::printf("Non-reassociating reference (using FMA):     %.8g\n",
               reference_C00_fma);
-  std::printf("Difference:                         %g\n",
+  std::printf("Difference:                                  %g\n",
               C_host_data[0] - reference_C00_fma);
-  std::printf("Non-reassociating reference (not using FMA):    %.8g\n",
+  std::printf("Non-reassociating reference (not using FMA): %.8g\n",
               reference_C00_nonfma);
-  std::printf("Difference:                         %g\n",
+  std::printf("Difference:                                  %g\n",
               C_host_data[0] - reference_C00_nonfma);
 }

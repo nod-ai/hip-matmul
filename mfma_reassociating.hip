@@ -100,7 +100,7 @@ int main() {
         std::fmaf(A_host_data[row0_layout(i)], B_host_data[row0_layout(i)],
                   reference_C00_fma);
     reference_C00_nonfma +=
-        A_host_data[row0_layout(i)] * B_host_data[row0_layout(i)];
+        (float)A_host_data[row0_layout(i)] * (float)B_host_data[row0_layout(i)];
   }
   std::printf("GPU result:                                  %.8g\n", C_host_data[0]);
   std::printf("Non-reassociating reference (using FMA):     %.8g\n",

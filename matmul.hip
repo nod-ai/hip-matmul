@@ -8,7 +8,7 @@
 
 #include <cstdio>
 #include <cxxabi.h>
-#include <functional>
+#include <optional>
 #include <random>
 #include <typeinfo>
 #include <vector>
@@ -37,22 +37,25 @@ struct TiledMatrixShape {
   tile_layout_func_t tile_layout;
 };
 
+struct MNKShape {
+  int M, N, K;
+};
+
 struct TiledMmtShape {
-  int M_outer, N_outer, K_outer;
-  int M_tile, N_tile, K_tile;
+  MNKShape outer, tile;
   tile_layout_func_t A_tile_layout, B_tile_layout, C_tile_layout;
 };
 
 __device__ __host__ TiledMatrixShape A_shape(const TiledMmtShape &s) {
-  return {s.M_outer, s.K_outer, s.M_tile, s.K_tile, s.A_tile_layout};
+  return {s.outer.M, s.outer.K, s.tile.M, s.tile.K, s.A_tile_layout};
 }
 
 __device__ __host__ TiledMatrixShape B_shape(const TiledMmtShape &s) {
-  return {s.N_outer, s.K_outer, s.N_tile, s.K_tile, s.B_tile_layout};
+  return {s.outer.N, s.outer.K, s.tile.N, s.tile.K, s.B_tile_layout};
 }
 
 __device__ __host__ TiledMatrixShape C_shape(const TiledMmtShape &s) {
-  return {s.M_outer, s.N_outer, s.M_tile, s.N_tile, s.C_tile_layout};
+  return {s.outer.M, s.outer.N, s.tile.M, s.tile.N, s.C_tile_layout};
 }
 
 __device__ __host__ int flatsize(const TiledMatrixShape &s) {
@@ -82,7 +85,7 @@ const char *str(Type t) {
   }
 }
 
-int type_size(Type t) {
+__device__ __host__ int type_size(Type t) {
   switch (t) {
   case Type::SI8:
     return 1;
@@ -98,11 +101,21 @@ int type_size(Type t) {
 }
 
 template <Type t> struct CTypeImpl {};
-template <> struct CTypeImpl<Type::SI8> { using type = int8_t; };
-template <> struct CTypeImpl<Type::SI16> { using type = int16_t; };
-template <> struct CTypeImpl<Type::SI32> { using type = int32_t; };
-template <> struct CTypeImpl<Type::FP16> { using type = _Float16; };
-template <> struct CTypeImpl<Type::FP32> { using type = float; };
+template <> struct CTypeImpl<Type::SI8> {
+  using type = int8_t;
+};
+template <> struct CTypeImpl<Type::SI16> {
+  using type = int16_t;
+};
+template <> struct CTypeImpl<Type::SI32> {
+  using type = int32_t;
+};
+template <> struct CTypeImpl<Type::FP16> {
+  using type = _Float16;
+};
+template <> struct CTypeImpl<Type::FP32> {
+  using type = float;
+};
 template <Type t> using CType = typename CTypeImpl<t>::type;
 
 template <Type type>
@@ -147,13 +160,13 @@ void checkMmtResults(const void *A_data_void, const void *B_data_void,
   const TC *C_data = static_cast<const TC *>(C_data_void);
   // This reference code is slow. To make the checks not too slow on
   // large matmuls, we only check the 4 corner tiles.
-  for (int m_outer : {0, s.M_outer - 1}) {
-    for (int n_outer : {0, s.N_outer - 1}) {
-      for (int m_tile = 0; m_tile < s.M_tile; ++m_tile) {
-        for (int n_tile = 0; n_tile < s.N_tile; ++n_tile) {
+  for (int m_outer : {0, s.outer.M - 1}) {
+    for (int n_outer : {0, s.outer.N - 1}) {
+      for (int m_tile = 0; m_tile < s.tile.M; ++m_tile) {
+        for (int n_tile = 0; n_tile < s.tile.N; ++n_tile) {
           float c = 0.f;
-          for (int k_outer = 0; k_outer < s.K_outer; ++k_outer) {
-            for (int k_tile = 0; k_tile < s.K_tile; ++k_tile) {
+          for (int k_outer = 0; k_outer < s.outer.K; ++k_outer) {
+            for (int k_tile = 0; k_tile < s.tile.K; ++k_tile) {
               TA a =
                   A_data[offset(A_shape(s), m_outer, k_outer, m_tile, k_tile)];
               TB b =
@@ -171,7 +184,7 @@ void checkMmtResults(const void *A_data_void, const void *B_data_void,
                     "n_tile=%d, at %s:%d. Note: outer MxNxK = %dx%dx%d\n",
                     static_cast<float>(actual), static_cast<float>(expected),
                     m_outer, n_outer, m_tile, n_tile, __FILE__, __LINE__,
-                    s.M_outer, s.N_outer, s.K_outer);
+                    s.outer.M, s.outer.N, s.outer.K);
             abort();
           }
         }
@@ -198,54 +211,81 @@ void checkMmtResults(Type A_type, Type B_type, Type C_type,
   abort();
 }
 
-typedef void (*mmt_func_t)(const void *, const void *, void *, int, int);
+typedef void (*mmt_func_t)(const void *, const void *, void *, void *, int, int,
+                           int);
 
+// Base class for matrix-times-matrix-transposed ("mmt") kernels.
+// As the RHS is transposed, the dimensions are:
+// LHS = "A-matrix" : MxK
+// RHS = "B-matrix" : NxK
+// Accumulator = "C-matrix": MxN
+//
+// The data layout is tiled with tile sizes given by the {M,N,K}_tile methods
+// and tile layouts given by the {A,B,C}_layout methods.
 class MmtKernel {
 public:
-  virtual ~MmtKernel(){};
+  virtual ~MmtKernel() {};
+  // Returns the element type of the A-matrix (LHS)
   virtual Type A_type() const = 0;
+  // Returns the element type of the B-matrix (RHS)
   virtual Type B_type() const = 0;
+  // Returns the element type of the C-matrix (accumulator/result)
   virtual Type C_type() const = 0;
+  // Returns the M-dimension tile size (rows of accumulator)
   virtual int M_tile() const = 0;
+  // Returns the N-dimension tile size (columns of accumulator)
   virtual int N_tile() const = 0;
+  // Returns the K-dimension tile size (reduction dimension)
   virtual int K_tile() const = 0;
+  // Returns the offset-computation function describing the A-matrix layout.
   virtual tile_layout_func_t A_tile_layout() const = 0;
+  // Returns the offset-computation function describing the B-matrix layout.
   virtual tile_layout_func_t B_tile_layout() const = 0;
+  // Returns the offset-computation function describing the C-matrix layout.
   virtual tile_layout_func_t C_tile_layout() const = 0;
+  // Returns the number of threads that the kernel requires running on.
   virtual int num_threads() const = 0;
+  // Returns a pointer to the device kernel.
   virtual mmt_func_t mmt_func() const = 0;
+  // Optional: kernels may override this method to override the default grid.
+  virtual std::optional<dim3>
+  get_work_centric_grid(const MNKShape & /*outer*/) const {
+    return {};
+  }
+  // Optional: kernels may override this to get an auxiliary device buffer of
+  // the given size in bytes.
+  virtual int aux_buffer_size(const MNKShape & /*outer*/) const { return 0; }
 };
 
-struct OuterShape {
-  int m, n, k;
-};
-
-OuterShape getBenchmarkOuterShape(const MmtKernel &kernel) {
+MNKShape getBenchmarkMNKShape(const MmtKernel &kernel) {
   int M = getIntEnvVar("M", 4096);
   int N = getIntEnvVar("N", 4096);
   int K = getIntEnvVar("K", 4096);
-  OuterShape o;
-  o.m = std::max(1, M / kernel.M_tile());
-  o.n = std::max(1, N / kernel.N_tile());
-  o.k = std::max(1, K / kernel.K_tile());
+  MNKShape o;
+  o.M = std::max(1, M / kernel.M_tile());
+  o.N = std::max(1, N / kernel.N_tile());
+  o.K = std::max(1, K / kernel.K_tile());
   return o;
 }
 
-TiledMmtShape getTestShape(const MmtKernel &kernel, const OuterShape &o) {
+TiledMmtShape getTestShape(const MmtKernel &kernel, const MNKShape &o) {
   TiledMmtShape s;
-  s.M_outer = o.m;
-  s.N_outer = o.n;
-  s.K_outer = o.k;
-  s.M_tile = kernel.M_tile();
-  s.N_tile = kernel.N_tile();
-  s.K_tile = kernel.K_tile();
+  s.outer = o;
+  s.tile.M = kernel.M_tile();
+  s.tile.N = kernel.N_tile();
+  s.tile.K = kernel.K_tile();
   s.A_tile_layout = kernel.A_tile_layout();
   s.B_tile_layout = kernel.B_tile_layout();
   s.C_tile_layout = kernel.C_tile_layout();
   return s;
 }
 
-void check(const MmtKernel &kernel, const OuterShape &o) {
+dim3 getLaunchGrid(const MmtKernel &kernel, const TiledMmtShape &s) {
+  return kernel.get_work_centric_grid(s.outer).value_or(
+      dim3(s.outer.M, s.outer.N));
+}
+
+void check(const MmtKernel &kernel, const MNKShape &o) {
   TiledMmtShape s = getTestShape(kernel, o);
   std::minstd_rand random_engine;
   std::vector<std::byte> A_host_data =
@@ -255,29 +295,37 @@ void check(const MmtKernel &kernel, const OuterShape &o) {
   std::vector<std::byte> C_host_data =
       makeRandomBuffer(kernel.C_type(), flatsize(C_shape(s)), random_engine);
 
-  float *A_device_buffer{};
-  float *B_device_buffer{};
-  float *C_device_buffer{};
+  void *A_device_buffer{};
+  void *B_device_buffer{};
+  void *C_device_buffer{};
+  void *aux_device_buffer{};
   TiledMmtShape *shape_device_buffer{};
   HIP_CHECK(hipMalloc(&A_device_buffer, A_host_data.size()));
   HIP_CHECK(hipMalloc(&B_device_buffer, B_host_data.size()));
   HIP_CHECK(hipMalloc(&C_device_buffer, C_host_data.size()));
+  HIP_CHECK(hipGetLastError());
+  int aux_buffer_size = kernel.aux_buffer_size(o);
+  HIP_CHECK(hipMalloc(&aux_device_buffer, aux_buffer_size));
+  HIP_CHECK(hipMemset(aux_device_buffer, 0, aux_buffer_size));
+  HIP_CHECK(hipGetLastError());
   HIP_CHECK(hipMalloc(&shape_device_buffer, sizeof s));
-
+  HIP_CHECK(hipGetLastError());
   HIP_CHECK(hipMemcpy(A_device_buffer, A_host_data.data(), A_host_data.size(),
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(B_device_buffer, B_host_data.data(), B_host_data.size(),
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(C_device_buffer, C_host_data.data(), C_host_data.size(),
                       hipMemcpyHostToDevice));
+
   HIP_CHECK(
       hipMemcpy(shape_device_buffer, &s, sizeof s, hipMemcpyHostToDevice));
-
-  const dim3 grid_dim(s.M_outer, s.N_outer);
+  HIP_CHECK(hipGetLastError());
+  const dim3 grid_dim = getLaunchGrid(kernel, s);
   const dim3 block_dim(kernel.num_threads());
-
+  HIP_CHECK(hipGetLastError());
   kernel.mmt_func()<<<grid_dim, block_dim, 0, hipStreamDefault>>>(
-      A_device_buffer, B_device_buffer, C_device_buffer, s.N_outer, s.K_outer);
+      A_device_buffer, B_device_buffer, C_device_buffer, aux_device_buffer,
+      s.outer.M, s.outer.N, s.outer.K);
   HIP_CHECK(hipGetLastError());
   HIP_CHECK(hipMemcpy(C_host_data.data(), C_device_buffer, C_host_data.size(),
                       hipMemcpyDeviceToHost));
@@ -288,28 +336,28 @@ void check(const MmtKernel &kernel, const OuterShape &o) {
   HIP_CHECK(hipFree(A_device_buffer));
   HIP_CHECK(hipFree(B_device_buffer));
   HIP_CHECK(hipFree(C_device_buffer));
+  HIP_CHECK(hipFree(aux_device_buffer));
   HIP_CHECK(hipFree(shape_device_buffer));
 }
 
 void check(const MmtKernel &kernel) {
   std::printf("  Checking correctness... ");
   // Test with more generic shapes than just M==N==K==2^x.
-  for (OuterShape o :
-       {OuterShape{1, 1, 1}, OuterShape{2, 1, 1}, OuterShape{1, 2, 1},
-        OuterShape{1, 1, 2}, OuterShape{1, 1, 3}, OuterShape{1, 1, 4},
-        OuterShape{1, 1, 5}, OuterShape{2, 2, 2}, OuterShape{2, 3, 4},
-        OuterShape{5, 2, 3}, OuterShape{1, 1, 10}, OuterShape{4, 4, 8},
-        OuterShape{8, 8, 4}, OuterShape{20, 20, 20}}) {
+  for (MNKShape o : {MNKShape{1, 1, 1}, MNKShape{2, 1, 1}, MNKShape{1, 2, 1},
+                     MNKShape{1, 1, 2}, MNKShape{1, 1, 3}, MNKShape{1, 1, 4},
+                     MNKShape{1, 1, 5}, MNKShape{2, 2, 2}, MNKShape{2, 3, 4},
+                     MNKShape{5, 2, 3}, MNKShape{1, 1, 10}, MNKShape{4, 4, 8},
+                     MNKShape{305, 1, 1}, MNKShape{20, 20, 20}}) {
     check(kernel, o);
   }
   std::printf("OK\n");
 }
 
-void benchmark(const MmtKernel &kernel, const OuterShape &o) {
+void benchmark(const MmtKernel &kernel, const MNKShape &o) {
   TiledMmtShape s = getTestShape(kernel, o);
   std::printf("  Benchmarking: total MxNxK=%dx%dx%d, outer MxNxK=%dx%dx%d ... ",
-              s.M_outer * s.M_tile, s.N_outer * s.N_tile, s.K_outer * s.K_tile,
-              s.M_outer, s.N_outer, s.K_outer);
+              s.outer.M * s.tile.M, s.outer.N * s.tile.N, s.outer.K * s.tile.K,
+              s.outer.M, s.outer.N, s.outer.K);
 
   std::minstd_rand random_engine;
   std::vector<std::byte> A_host_data =
@@ -319,13 +367,17 @@ void benchmark(const MmtKernel &kernel, const OuterShape &o) {
   std::vector<std::byte> C_host_data =
       makeRandomBuffer(kernel.C_type(), flatsize(C_shape(s)), random_engine);
 
-  float *A_device_buffer{};
-  float *B_device_buffer{};
-  float *C_device_buffer{};
+  void *A_device_buffer{};
+  void *B_device_buffer{};
+  void *C_device_buffer{};
+  void *aux_device_buffer{};
   TiledMmtShape *shape_device_buffer{};
   HIP_CHECK(hipMalloc(&A_device_buffer, A_host_data.size()));
   HIP_CHECK(hipMalloc(&B_device_buffer, B_host_data.size()));
   HIP_CHECK(hipMalloc(&C_device_buffer, C_host_data.size()));
+  int aux_buffer_size = kernel.aux_buffer_size(o);
+  HIP_CHECK(hipMalloc(&aux_device_buffer, aux_buffer_size));
+  HIP_CHECK(hipMemset(aux_device_buffer, 0, aux_buffer_size));
   HIP_CHECK(hipMalloc(&shape_device_buffer, sizeof s));
 
   HIP_CHECK(hipMemcpy(A_device_buffer, A_host_data.data(), A_host_data.size(),
@@ -337,7 +389,7 @@ void benchmark(const MmtKernel &kernel, const OuterShape &o) {
   HIP_CHECK(
       hipMemcpy(shape_device_buffer, &s, sizeof s, hipMemcpyHostToDevice));
 
-  const dim3 grid_dim(s.M_outer, s.N_outer);
+  const dim3 grid_dim = getLaunchGrid(kernel, s);
   const dim3 block_dim(kernel.num_threads());
 
   hipEvent_t start, stop;
@@ -351,8 +403,8 @@ void benchmark(const MmtKernel &kernel, const OuterShape &o) {
     HIP_CHECK(hipEventRecord(start, hipStreamDefault));
     for (int b = 0; b < iterations; ++b) {
       kernel.mmt_func()<<<grid_dim, block_dim, 0, hipStreamDefault>>>(
-          A_device_buffer, B_device_buffer, C_device_buffer, s.N_outer,
-          s.K_outer);
+          A_device_buffer, B_device_buffer, C_device_buffer, aux_device_buffer,
+          s.outer.M, s.outer.N, s.outer.K);
     }
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipEventRecord(stop, hipStreamDefault));
@@ -370,10 +422,10 @@ void benchmark(const MmtKernel &kernel, const OuterShape &o) {
   }
   float kernel_ms = elapsed_ms / iterations;
   float kernel_ops =
-      2.f * s.M_outer * s.N_outer * s.K_outer * s.M_tile * s.N_tile * s.K_tile;
-  float kernel_bytes_read = static_cast<float>(sizeof(float)) * s.M_outer *
-                            s.N_outer * s.K_outer * (s.M_tile + s.N_tile) *
-                            s.K_tile;
+      2.f * s.outer.M * s.outer.N * s.outer.K * s.tile.M * s.tile.N * s.tile.K;
+  float kernel_bytes_read = static_cast<float>(sizeof(float)) * s.outer.M *
+                            s.outer.N * s.outer.K * (s.tile.M + s.tile.N) *
+                            s.tile.K;
   float kernel_ops_per_s = 1000.f * kernel_ops / kernel_ms;
   float kernel_bytes_read_per_s = 1000.f * kernel_bytes_read / kernel_ms;
   std::printf("%.4g Tflop/s, read %.4g TB/s, iterations=%d\n",
@@ -385,6 +437,7 @@ void benchmark(const MmtKernel &kernel, const OuterShape &o) {
   HIP_CHECK(hipFree(A_device_buffer));
   HIP_CHECK(hipFree(B_device_buffer));
   HIP_CHECK(hipFree(C_device_buffer));
+  HIP_CHECK(hipFree(aux_device_buffer));
   HIP_CHECK(hipFree(shape_device_buffer));
 }
 
@@ -405,7 +458,7 @@ void test(const MmtKernel &kernel) {
     check(kernel);
   }
 
-  OuterShape o = getBenchmarkOuterShape(kernel);
+  MNKShape o = getBenchmarkMNKShape(kernel);
   benchmark(kernel, o);
 }
 
@@ -430,7 +483,8 @@ class MmtKernel_generic : public MmtKernel {
   virtual int num_threads() const override { return T_M_tile * T_N_tile; }
   virtual mmt_func_t mmt_func() const override { return run; };
   __global__ static void run(const void *A_data, const void *B_data,
-                             void *C_data, int N_outer, int K_outer) {
+                             void *C_data, void * /*aux_data*/, int /*M_outer*/,
+                             int N_outer, int K_outer) {
     using TA = CType<T_A_type>;
     using TB = CType<T_B_type>;
     using TC = CType<T_C_type>;
@@ -477,10 +531,9 @@ class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MmtKernel {
   }
   virtual int num_threads() const override { return 64; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(64) static void run(const void *A_data,
-                                                   const void *B_data,
-                                                   void *C_data, int N_outer,
-                                                   int K_outer) {
+  __global__ __launch_bounds__(64) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -532,10 +585,9 @@ class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC
   }
   virtual int num_threads() const override { return 64; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(64) static void run(const void *A_data,
-                                                   const void *B_data,
-                                                   void *C_data, int N_outer,
-                                                   int K_outer) {
+  __global__ __launch_bounds__(64) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -582,10 +634,9 @@ class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   }
   virtual int num_threads() const override { return 64; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(64) static void run(const void *A_data,
-                                                   const void *B_data,
-                                                   void *C_data, int N_outer,
-                                                   int K_outer) {
+  __global__ __launch_bounds__(64) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -627,10 +678,9 @@ class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4 : public MmtKernel {
   }
   virtual int num_threads() const override { return 64; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(64) static void run(const void *A_data,
-                                                   const void *B_data,
-                                                   void *C_data, int N_outer,
-                                                   int K_outer) {
+  __global__ __launch_bounds__(64) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -680,10 +730,9 @@ class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4
   }
   virtual int num_threads() const override { return 64; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(64) static void run(const void *A_data,
-                                                   const void *B_data,
-                                                   void *C_data, int N_outer,
-                                                   int K_outer) {
+  __global__ __launch_bounds__(64) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -767,10 +816,9 @@ class MmtKernel_128t_1x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   }
   virtual int num_threads() const override { return 128; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(128) static void run(const void *A_data,
-                                                    const void *B_data,
-                                                    void *C_data, int N_outer,
-                                                    int K_outer) {
+  __global__ __launch_bounds__(128) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -826,10 +874,9 @@ class MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(256) static void run(const void *A_data,
-                                                    const void *B_data,
-                                                    void *C_data, int N_outer,
-                                                    int K_outer) {
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -886,10 +933,9 @@ class MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(256) static void run(const void *A_data,
-                                                    const void *B_data,
-                                                    void *C_data, int N_outer,
-                                                    int K_outer) {
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc = {0};
 
@@ -1024,10 +1070,9 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(256) static void run(const void *A_data,
-                                                    const void *B_data,
-                                                    void *C_data, int N_outer,
-                                                    int K_outer) {
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc[MS][NS / 4] = {{0}};
 
@@ -1165,10 +1210,9 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(256) static void run(const void *A_data,
-                                                    const void *B_data,
-                                                    void *C_data, int N_outer,
-                                                    int K_outer) {
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc[MS][NS / 4] = {{0}};
 
@@ -1321,10 +1365,9 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(256) static void run(const void *A_data,
-                                                    const void *B_data,
-                                                    void *C_data, int N_outer,
-                                                    int K_outer) {
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc[MS][NS / 4] = {{0}};
 
@@ -1415,10 +1458,9 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_subgroup2x2
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(256) static void run(const void *A_data,
-                                                    const void *B_data,
-                                                    void *C_data, int N_outer,
-                                                    int K_outer) {
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc[MS / 2][NS / 2] = {{0}};
 
@@ -1509,10 +1551,9 @@ class
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(256) static void run(const void *A_data,
-                                                    const void *B_data,
-                                                    void *C_data, int N_outer,
-                                                    int K_outer) {
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc[MS][NS / 4] = {{0}};
 
@@ -1565,8 +1606,10 @@ class
           }
         }
       }
-      // No __syncthreads here, the next iteration will load into separate
-      // parts of A_shared and B_shared.
+      // We thought that there should be no __syncthreads here, as the next
+      // iteration will load into separate parts of A_shared and B_shared.
+      // But we observed a data race giving intermittent failures in practice.
+      __syncthreads();
     }
 
     for (int k = 0; k < 4; ++k) {
@@ -1628,10 +1671,9 @@ class
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(256) static void run(const void *A_data,
-                                                    const void *B_data,
-                                                    void *C_data, int N_outer,
-                                                    int K_outer) {
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc[MS][NS / 4] = {{0}};
 
@@ -1745,10 +1787,9 @@ class MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4
   }
   virtual int num_threads() const override { return 1024; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(1024) static void run(const void *A_data,
-                                                     const void *B_data,
-                                                     void *C_data, int N_outer,
-                                                     int K_outer) {
+  __global__ __launch_bounds__(1024) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc[MS / 4][NS / 4] = {{0}};
 
@@ -1840,10 +1881,9 @@ class
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(256) static void run(const void *A_data,
-                                                    const void *B_data,
-                                                    void *C_data, int N_outer,
-                                                    int K_outer) {
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using floatx2_t = __attribute__((__vector_size__(2 * sizeof(float)))) float;
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
     floatx4_t acc[MS][NS / 4] = {{0}};
@@ -1942,10 +1982,9 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(256) static void run(const void *A_data,
-                                                    const void *B_data,
-                                                    void *C_data, int N_outer,
-                                                    int K_outer) {
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using float16x4_t =
         __attribute__((__vector_size__(4 * sizeof(_Float16)))) _Float16;
     using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
@@ -2035,10 +2074,9 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(256) static void run(const void *A_data,
-                                                    const void *B_data,
-                                                    void *C_data, int N_outer,
-                                                    int K_outer) {
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using float16x4_t =
         __attribute__((__vector_size__(4 * sizeof(_Float16)))) _Float16;
     using float16x8_t =
@@ -2101,6 +2139,374 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
   }
 };
 
+template <typename A, typename B>
+__device__ __host__ std::common_type_t<A, B> ceil_div(A a, B b) {
+  return (a + b - 1) / b;
+}
+
+template <int Po2, typename A> __device__ __host__ A round_up_to_po2(A a) {
+  static_assert(Po2 > 0 && (Po2 & (Po2 - 1)) == 0);
+  return ((a - 1) | (Po2 - 1)) + 1;
+}
+
+// A simple Stream-K kernel variant of
+// MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2.
+//
+// The synchronization between workgroups cooperating on a tile is wait-free
+// and produces deterministic results. This is achieved using a per-tile atomic
+// counter to determine which workgroup is the last to complete its share of the
+// tile's computation. That workgroup will then go on to perform the final
+// reduction of the multiple workgroups' local accumulators into the final
+// accumulator. The results are still deterministic thanks to performing that
+// final reduction in order of increasing K-dimension indices, regardless of
+// which workgroup happens to be doing it.
+//
+// The inner arithmetic loops isn't particularly optimized, being the same as in
+// MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2.
+// Like in other kernels, the template parameters MS and NS control the number
+// of MFMA intrinsics in the kernel along the M and N dimensions respectively:
+// MS x (NS / 4), while 4 subgroups are stacked along the NS dimension,
+// achieving a total width of MS x NS MFMA intrinsics across all 4 subgroups.
+//
+template <int MS, int NS>
+class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
+    : public MmtKernel {
+  static_assert(MS >= 4 && !(MS % 4));
+  static_assert(NS >= 4 && !(NS % 4));
+  // Defining some values as constants as they will be needed in static methods
+  // below.
+  static constexpr Type static_A_type = Type::FP16;
+  static constexpr Type static_B_type = Type::FP16;
+  static constexpr Type static_C_type = Type::FP32;
+  static constexpr int static_M_tile = MS * 16;
+  static constexpr int static_N_tile = NS * 16;
+  static constexpr int static_K_tile = 32;
+  // Standard MmtKernel interface methods override describing element types.
+  virtual Type A_type() const override { return static_A_type; }
+  virtual Type B_type() const override { return static_B_type; }
+  virtual Type C_type() const override { return static_C_type; }
+  // Standard MmtKernel interface methods override describing tile shapes.
+  virtual int M_tile() const override { return static_M_tile; }
+  virtual int N_tile() const override { return static_N_tile; }
+  virtual int K_tile() const override { return static_K_tile; }
+  // Standard MmtKernel interface methods override describing tile layouts.
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) {
+      int mi = m % 16;
+      int mo = m / 16;
+      return 512 * mo + 128 * ((k % 16) / 4) + 8 * mi + 4 * (k / 16) + (k % 4);
+    };
+  }
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) {
+      int ni = n % 16;
+      int no = n / 16;
+      return 512 * no + 128 * ((k % 16) / 4) + 8 * ni + 4 * (k / 16) + (k % 4);
+    };
+  }
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) {
+      int mi = m % 16;
+      int mo = m / 16;
+      int ni = n % 16;
+      int no = n / 16;
+      return NS * 256 * mo + 256 * no + 64 * (mi / 4) + 4 * ni + (mi % 4);
+    };
+  }
+  // Standard MmtKernel interface method override describing number of threads.
+  virtual int num_threads() const override { return 256; }
+  // Additional constants and local helpers (static methods) for work-centric
+  // grid and auxiliary buffer allocation.
+  //
+  // Maximum number of Compute Units that we aim to use on sufficiently large
+  // problems. This value assumes a MI300X in SPX mode.
+  static constexpr int MaxCUs = 304;
+  // Alignment to use when coalescing device buffers to avoid alignment-related
+  // performance caveats.
+  static constexpr int device_alignment = 128;
+  // Alignment to use for atomics to avoid false-sharing effects.
+  static constexpr int atomics_alignment = 128;
+  // Returns the number of Compute Units that we aim to use for the problem
+  // shape with given `outer` shape (expressed in units of this kernel's tiles).
+  static __device__ __host__ int get_cu_count(const MNKShape &outer) {
+    int64_t total_iters = static_cast<int64_t>(outer.M) * outer.N * outer.K;
+    return std::min(static_cast<int64_t>(MaxCUs), total_iters);
+  }
+  static __device__ __host__ int get_tile_count(const MNKShape &outer) {
+    return outer.M * outer.N;
+  }
+  // Returns the buffer bytes to allocate in the auxiliary buffer for the atomic
+  // counters (one per tile).
+  using atomic_t = int;
+  static __device__ __host__ int atomics_buffer_size(const MNKShape &outer) {
+    return round_up_to_po2<device_alignment>(
+        get_tile_count(outer) *
+        round_up_to_po2<atomics_alignment>(sizeof(atomic_t)));
+  }
+  // Returns the number of local accumulator buffers to allocate in the
+  // auxiliary buffer, per tile. This value is a coarse upper bound, could be
+  // refined to trim memory usage.
+  static __device__ __host__ int
+  local_accumulators_count_per_tile(const MNKShape &outer) {
+    return 1 + ceil_div(get_cu_count(outer), get_tile_count(outer));
+  }
+  // Return the overall number of local accumulator buffers to allocate in the
+  // auxiliary buffer. This value is a coarse upper bound, could be
+  // refined to trim memory usage.
+  static __device__ __host__ int
+  local_accumulators_count(const MNKShape &outer) {
+    return local_accumulators_count_per_tile(outer) * get_tile_count(outer);
+  }
+  // Return the overall auxiliary buffer bytes to allocate.
+  static __device__ __host__ int
+  local_accumulators_buffer_size(const MNKShape &outer) {
+    return round_up_to_po2<device_alignment>(local_accumulators_count(outer) *
+                                             static_M_tile * static_N_tile *
+                                             type_size(static_C_type));
+  }
+  // Standard MmtKernel interface method override describing the work-centric
+  // grid.
+  virtual std::optional<dim3>
+  get_work_centric_grid(const MNKShape &outer) const override {
+    return {get_cu_count(outer)};
+  }
+  // Standard MmtKernel interface method override describing the auxiliary
+  // buffer size to allocate.
+  virtual int aux_buffer_size(const MNKShape &outer) const override {
+    return atomics_buffer_size(outer) + local_accumulators_buffer_size(outer);
+  }
+  // Standard MmtKernel interface method override describing the actual device
+  // kernel.
+  virtual mmt_func_t mmt_func() const override { return run; };
+  // Some typedefs used in the kernel implementation.
+  using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+  using float16x4_t =
+      __attribute__((__vector_size__(4 * sizeof(_Float16)))) _Float16;
+  using float16x8_t =
+      __attribute__((__vector_size__(8 * sizeof(_Float16)))) _Float16;
+  // Device kernel implementation.
+  __global__ __launch_bounds__(256) static void run(const void *A_data,
+                                                    const void *B_data,
+                                                    void *C_data,
+                                                    void *aux_data, int M_outer,
+                                                    int N_outer, int K_outer) {
+    MNKShape outer{M_outer, N_outer, K_outer};
+    // Get local accumulators buffer.
+    char *aux_bytes = static_cast<char *>(aux_data);
+    float *local_accumulators_buffer =
+        reinterpret_cast<float *>(aux_bytes + atomics_buffer_size(outer));
+    // General arithmetic just like in Algorithm 5 in
+    // https://arxiv.org/pdf/2301.03598, except we use the AMD term "CU" for
+    // "Compute Unit" instead of "CTA".
+    int iters_per_tile = K_outer;
+    int total_tiles = M_outer * N_outer;
+    int total_iters = total_tiles * iters_per_tile;
+    int cu_count = get_cu_count(outer);
+    int cu = blockIdx.x;
+    int iter_start = cu * total_iters / cu_count;
+    int iter_end = (cu + 1) * total_iters / cu_count;
+    int iter = iter_start;
+    // Work-centric loop on iterations to be handled by this compute unit.
+    while (iter < iter_end) {
+      // Still same variable names as in Algorithm 5 in
+      // https://arxiv.org/pdf/2301.03598.
+      int tile_idx = iter / iters_per_tile;
+      int tile_iter_start = tile_idx * iters_per_tile;
+      int tile_iter_end = tile_iter_start + iters_per_tile;
+      int local_iter = iter - tile_iter_start;
+      int local_iter_end = std::min(tile_iter_end, iter_end) - tile_iter_start;
+      if (local_iter == local_iter_end) {
+        break;
+      }
+      // Map the 1D tile_idx to 2D (m_outer, n_outer) position in the C-matrix
+      // tile space, using MxN-lexicographic order.
+      int m_outer = tile_idx / N_outer;
+      int n_outer = tile_idx - m_outer * N_outer;
+      // The next step is specific to our wait-free atomic approach: we need to
+      // know the interval of other compute units cooperating with the current
+      // compute unit on the current tile.
+      int cooperating_cu_start =
+          ceil_div((tile_iter_start + 1) * cu_count, total_iters) - 1;
+      int cooperating_cu_end = ceil_div(tile_iter_end * cu_count, total_iters);
+      assert(cu >= cooperating_cu_start);
+      assert(cu < cooperating_cu_end);
+      // Get the address to this tile's specific atomic counter, to synchronize
+      // with those cooperating compute units.
+      atomic_t *atomic_counter = reinterpret_cast<atomic_t *>(
+          aux_bytes + tile_idx * atomics_alignment);
+
+      floatx4_t *C_ptr = static_cast<floatx4_t *>(C_data) +
+                         MS * NS * 16 * 4 * (N_outer * m_outer + n_outer);
+
+      // Two cases depending on whether we are cooperating on this tile with
+      // other CUs.
+      if (cooperating_cu_end == cooperating_cu_start + 1) {
+        // Easy case: no other CU cooperating with us. We compute the full tile
+        // and store it directly to destination.
+        mac_loop(A_data, B_data, C_ptr, K_outer, m_outer, n_outer, local_iter,
+                 local_iter_end);
+      } else {
+        // Hard case: cooperating with other CUs. We need to get a pointer to
+        // a local accumulator buffer that we can store our partial accumulator
+        // to. That depends on our CU's position in its cooperating group.
+        int cu_idx_in_cooperating_group = cu - cooperating_cu_start;
+        int local_accumulator_idx =
+            cu_idx_in_cooperating_group +
+            tile_idx * local_accumulators_count_per_tile(
+                           MNKShape{M_outer, N_outer, K_outer});
+        floatx4_t *local_accumulator = reinterpret_cast<floatx4_t *>(
+            local_accumulators_buffer +
+            local_accumulator_idx * static_M_tile * static_N_tile);
+        // Perform the MFMA arithmetic, store to our local partial accumulator.
+        mac_loop(A_data, B_data, local_accumulator, K_outer, m_outer, n_outer,
+                 local_iter, local_iter_end);
+        // Now, conditionally on an atomic counter telling us if it's for us to
+        // do, maybe perform the final reduction.
+        maybe_do_final_reduction(C_ptr, M_outer, N_outer, K_outer,
+                                 atomic_counter, local_accumulators_buffer,
+                                 tile_idx, cooperating_cu_start,
+                                 cooperating_cu_end);
+      }
+      iter = tile_iter_end;
+    }
+  }
+  // Helper: inner MFMA loop. Similar to the MacLoop function given in
+  // Algorithm 4 in https://arxiv.org/pdf/2301.03598.
+  __device__ static void mac_loop(const void *A_data, const void *B_data,
+                                  floatx4_t *C_ptr, int K_outer, int m_outer,
+                                  int n_outer, int k_iter_start,
+                                  int k_iter_end) {
+    // Accumulator VGPRs.
+    floatx4_t acc[MS][NS / 4] = {{0}};
+    int tid = threadIdx.x;
+    constexpr int A_tile_size_in_vec8 = MS * 16 * 4;
+    constexpr int B_tile_size_in_vec8 = NS * 16 * 4;
+    const float16x8_t *A_global =
+        static_cast<const float16x8_t *>(A_data) +
+        (m_outer * K_outer + k_iter_start) * A_tile_size_in_vec8;
+    const float16x8_t *B_global =
+        static_cast<const float16x8_t *>(B_data) +
+        (n_outer * K_outer + k_iter_start) * B_tile_size_in_vec8;
+    const float16x8_t *A_global_ptr = A_global + tid;
+    const float16x8_t *B_global_ptr = B_global + tid;
+
+    // Shared memory buffers for tiles of A and B matrices.
+    __shared__ float16x8_t A_shared[A_tile_size_in_vec8];
+    __shared__ float16x8_t B_shared[B_tile_size_in_vec8];
+
+    // Inner loop on K dimenion.
+    for (int k_iter = k_iter_start; k_iter < k_iter_end; ++k_iter) {
+      // Load data from global to shared memory.
+      for (int i = 0; i < A_tile_size_in_vec8; i += 256) {
+        A_shared[i + tid] = A_global_ptr[i];
+      }
+      for (int j = 0; j < B_tile_size_in_vec8; j += 256) {
+        B_shared[j + tid] = B_global_ptr[j];
+      }
+      A_global_ptr += A_tile_size_in_vec8;
+      B_global_ptr += B_tile_size_in_vec8;
+      __syncthreads();
+      // Perform MFMA arithmetic on data in shared memory.
+      for (int i = 0; i < MS; ++i) {
+        for (int j = 0; j < NS / 4; ++j) {
+          float16x8_t a = A_shared[64 * i + (tid % 64)];
+          float16x8_t b = B_shared[256 * j + tid];
+          float16x4_t a0 = (float16x4_t){a[0], a[1], a[2], a[3]};
+          float16x4_t a1 = (float16x4_t){a[4], a[5], a[6], a[7]};
+          float16x4_t b0 = (float16x4_t){b[0], b[1], b[2], b[3]};
+          float16x4_t b1 = (float16x4_t){b[4], b[5], b[6], b[7]};
+          acc[i][j] =
+              __builtin_amdgcn_mfma_f32_16x16x16f16(a0, b0, acc[i][j], 0, 0, 0);
+          acc[i][j] =
+              __builtin_amdgcn_mfma_f32_16x16x16f16(a1, b1, acc[i][j], 0, 0, 0);
+        }
+      }
+      __syncthreads();
+    }
+
+    // Store accumulator VGPRs to memory destination (might be either local
+    // accumulators or directly C matrix destination, depending on the caller).
+    for (int i = 0; i < MS; ++i) {
+      for (int j = 0; j < NS / 4; ++j) {
+        C_ptr[256 * (NS / 4 * i + j) + tid] = acc[i][j];
+      }
+    }
+  }
+  // Helper: maybe perform the final reduction of partial accumulators to the
+  // destination C-matrix. The condition depends on atomic counter increments
+  // telling us if we are the CU that is responsible for this among other CUs
+  // cooperating on a tile. It is thus non-deterministic which CU will perform
+  // this final reduction, but the final C-matrix elements must be
+  // deterministic. This is achieved by deterministically looping over the
+  // partial accumulators in order of increasing K-dimension indices, regardless
+  // of which partial accumulators were computed earlier than others.
+  __device__ static void
+  maybe_do_final_reduction(floatx4_t *C_ptr, int M_outer, int N_outer,
+                           int K_outer, atomic_t *atomic_counter,
+                           float *local_accumulators_buffer, int tile_idx,
+                           int cooperating_cu_start, int cooperating_cu_end) {
+    // We need to perform the atomic counter increment on one thread only, and
+    // then publish the result of that atomic increment to other threads in the
+    // workgroup. We use a __shared__ integer for that purpose.
+    __shared__ int workgroup_counter_value;
+    int tid = threadIdx.x;
+    if (tid == 0) {
+      // Thread0 fetches and increments the device-wide atomic_counter.
+      // This is a relaxed atomic, which is fine, as we provide the memory
+      // ordering separately below with __builtin_amdgcn_fence, which usefully
+      // allows us to specify the memory scope.
+      int thread0_counter_value = atomicAdd(atomic_counter, 1);
+      // Thread0 stores the value to the workgroup-wide shared location.
+      workgroup_counter_value = thread0_counter_value;
+      // Memory scope is "agent" because we need other workgroups to see this.
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+    }
+    // Now all threads in the workgroup load the workgroup-wide shared value.
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    // Now we can determine, based on that atomic counter value, whether to
+    // return early or proceed with the final reduction.
+    if (workgroup_counter_value + 1 !=
+        cooperating_cu_end - cooperating_cu_start) {
+      // Return early: let another CU handle the final reduction.
+      return;
+    }
+    // Perform the final reduction on the current CU!
+    //
+    // Reset the atomic counter to 0 so that the auxiliary buffer is ready to
+    // reuse in another kernel launch.
+    if (threadIdx.x == 0) {
+      *atomic_counter = 0;
+    }
+    static constexpr int num_acc_vec4s = MS * NS / 4;
+    floatx4_t acc[num_acc_vec4s] = {0};
+    for (int i = 0; i < num_acc_vec4s; ++i) {
+      acc[i] = floatx4_t{0.f, 0.f, 0.f, 0.f};
+    }
+    // Sum the partial accumulators in deterministic order of increasing
+    // compute unit index, which makes to determinisic order of increasing K
+    // dimension index.
+    for (int other_cu = cooperating_cu_start; other_cu < cooperating_cu_end;
+         ++other_cu) {
+      int other_cu_idx_in_cooperating_group = other_cu - cooperating_cu_start;
+      int other_local_accumulator_idx =
+          other_cu_idx_in_cooperating_group +
+          tile_idx * local_accumulators_count_per_tile(
+                         MNKShape{M_outer, N_outer, K_outer});
+      floatx4_t *other_accum_ptr = reinterpret_cast<floatx4_t *>(
+          local_accumulators_buffer +
+          other_local_accumulator_idx * static_M_tile * static_N_tile);
+      for (int i = 0; i < num_acc_vec4s; ++i) {
+        acc[i] += other_accum_ptr[256 * i + tid];
+      }
+    }
+    // Store to final destination.
+    for (int i = 0; i < num_acc_vec4s; ++i) {
+      C_ptr[256 * i + tid] = acc[i];
+    }
+  }
+};
+
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_32x32x16i8_shared
     : public MmtKernel {
@@ -2138,10 +2544,9 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_32x32x16i8_shared
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(256) static void run(const void *A_data,
-                                                    const void *B_data,
-                                                    void *C_data, int N_outer,
-                                                    int K_outer) {
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using int8x8_t = int64_t;
     using int32x16_t = __attribute__((__vector_size__(4 * 16))) int32_t;
     int32x16_t acc[MS][NS / 4] = {{0}};
@@ -2230,10 +2635,9 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(256) static void run(const void *A_data,
-                                                    const void *B_data,
-                                                    void *C_data, int N_outer,
-                                                    int K_outer) {
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using int8x8_t = int64_t;
     using int32x4_t = __attribute__((__vector_size__(4 * 4))) int32_t;
     int32x4_t acc[MS][NS / 4] = {{0}};
@@ -2324,10 +2728,9 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(256) static void run(const void *A_data,
-                                                    const void *B_data,
-                                                    void *C_data, int N_outer,
-                                                    int K_outer) {
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using int64x2_t = __attribute__((__vector_size__(8 * 2))) int64_t;
     using int32x4_t = __attribute__((__vector_size__(4 * 4))) int32_t;
     int32x4_t acc[MS][NS / 4] = {{0}};
@@ -2420,10 +2823,9 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(256) static void run(const void *A_data,
-                                                    const void *B_data,
-                                                    void *C_data, int N_outer,
-                                                    int K_outer) {
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using int64x2_t = __attribute__((__vector_size__(8 * 2))) int64_t;
     using int32x4_t = __attribute__((__vector_size__(4 * 4))) int32_t;
     int32x4_t acc[MS][NS / 4] = {{0}};
@@ -2553,10 +2955,9 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipeline_v3
   }
   virtual int num_threads() const override { return 256; }
   virtual mmt_func_t mmt_func() const override { return run; };
-  __global__ __launch_bounds__(256) static void run(const void *A_data,
-                                                    const void *B_data,
-                                                    void *C_data, int N_outer,
-                                                    int K_outer) {
+  __global__ __launch_bounds__(256) static void run(
+      const void *A_data, const void *B_data, void *C_data, void * /*aux_data*/,
+      int /*M_outer*/, int N_outer, int K_outer) {
     using int64x2_t = __attribute__((__vector_size__(8 * 2))) int64_t;
     using int32x4_t = __attribute__((__vector_size__(4 * 4))) int32_t;
     int32x4_t acc[MS][NS / 4] = {{0}};
@@ -2581,7 +2982,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipeline_v3
     int64x2_t B_vgpr0[B_tile_size_in_vec16 / num_threads];
 
     int64x2_t A_block_vgpr1[MS];
-    int64x2_t B_block_vgpr1[NS/2];
+    int64x2_t B_block_vgpr1[NS / 2];
 
     auto global_to_vgpr0 = [&]() {
       for (int i = 0; i < A_tile_size_in_vec16 / num_threads; ++i) {
@@ -2621,9 +3022,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipeline_v3
       }
     };
 
-    auto sync = [] {
-      __builtin_amdgcn_s_barrier();
-    };
+    auto sync = [] { __builtin_amdgcn_s_barrier(); };
 
     global_to_vgpr0();
     vpgr0_to_shared();
@@ -2714,4 +3113,9 @@ int main() {
   test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2<8, 8>());
   test(MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload<
        8, 8>());
+
+  std::printf("\n\n\nStream-K experiments:\n\n");
+  test(
+      MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2<8,
+                                                                          8>());
 }

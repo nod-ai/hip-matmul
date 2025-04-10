@@ -492,18 +492,18 @@ class MmtKernel_generic : public MmtKernel {
     int n_outer = blockIdx.y;
     int m_tile = threadIdx.x / T_N_tile;
     int n_tile = threadIdx.x % T_N_tile;
-    float c = 0.f;
+    TC c = {0};
     for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
       for (int k_tile = 0; k_tile < T_K_tile; ++k_tile) {
-        float a = static_cast<const TA *>(
+        TA a = static_cast<const TA *>(
             A_data)[k_tile +
                     T_K_tile *
                         (m_tile + T_M_tile * (k_outer + K_outer * m_outer))];
-        float b = static_cast<const TB *>(
+        TB b = static_cast<const TB *>(
             B_data)[k_tile +
                     T_K_tile *
                         (n_tile + T_N_tile * (k_outer + K_outer * n_outer))];
-        c += a * b;
+        c += static_cast<TC>(a) * static_cast<TC>(b);
       }
     }
     static_cast<TC *>(

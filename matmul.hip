@@ -2284,6 +2284,8 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
       __attribute__((__vector_size__(4 * sizeof(_Float16)))) _Float16;
   using float16x8_t =
       __attribute__((__vector_size__(8 * sizeof(_Float16)))) _Float16;
+  static constexpr int num_acc_vec4s = MS * NS / 4;
+  using acc_array_t = std::array<floatx4_t, MS * NS / 4>;
   // Device kernel implementation.
   __global__ __launch_bounds__(256) static void run(const void *A_data,
                                                     const void *B_data,
@@ -2322,7 +2324,11 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
       // tile space, using MxN-lexicographic order.
       int m_outer = tile_idx / N_outer;
       int n_outer = tile_idx - m_outer * N_outer;
-      // The next step is specific to our wait-free atomic approach: we need to
+
+      acc_array_t acc =  mac_loop(A_data, B_data, K_outer, m_outer, n_outer, local_iter,
+        local_iter_end);
+
+      // Thext step is specific to our wait-free atomic approach: we need to
       // know the interval of other compute units cooperating with the current
       // compute unit on the current tile.
       int cooperating_cu_start =
@@ -2330,54 +2336,90 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
       int cooperating_cu_end = ceil_div(tile_iter_end * cu_count, total_iters);
       assert(cu >= cooperating_cu_start);
       assert(cu < cooperating_cu_end);
-      // Get the address to this tile's specific atomic counter, to synchronize
-      // with those cooperating compute units.
-      atomic_t *atomic_counter = reinterpret_cast<atomic_t *>(
-          aux_bytes + tile_idx * atomics_alignment);
 
-      floatx4_t *C_ptr = static_cast<floatx4_t *>(C_data) +
-                         MS * NS * 16 * 4 * (N_outer * m_outer + n_outer);
+      int cooperating_cu_count = cooperating_cu_end - cooperating_cu_start;
 
-      // Two cases depending on whether we are cooperating on this tile with
-      // other CUs.
-      if (cooperating_cu_end == cooperating_cu_start + 1) {
-        // Easy case: no other CU cooperating with us. We compute the full tile
-        // and store it directly to destination.
-        mac_loop(A_data, B_data, C_ptr, K_outer, m_outer, n_outer, local_iter,
-                 local_iter_end);
-      } else {
-        // Hard case: cooperating with other CUs. We need to get a pointer to
-        // a local accumulator buffer that we can store our partial accumulator
-        // to. That depends on our CU's position in its cooperating group.
+      // Hard case: cooperating with other CUs on this tile.
+      if (cooperating_cu_count != 1) {
         int cu_idx_in_cooperating_group = cu - cooperating_cu_start;
         int local_accumulator_idx =
             cu_idx_in_cooperating_group +
             tile_idx * local_accumulators_count_per_tile(
-                           MNKShape{M_outer, N_outer, K_outer});
+                            MNKShape{M_outer, N_outer, K_outer});
         floatx4_t *local_accumulator = reinterpret_cast<floatx4_t *>(
             local_accumulators_buffer +
             local_accumulator_idx * static_M_tile * static_N_tile);
-        // Perform the MFMA arithmetic, store to our local partial accumulator.
-        mac_loop(A_data, B_data, local_accumulator, K_outer, m_outer, n_outer,
-                 local_iter, local_iter_end);
-        // Now, conditionally on an atomic counter telling us if it's for us to
-        // do, maybe perform the final reduction.
-        maybe_do_final_reduction(C_ptr, M_outer, N_outer, K_outer,
-                                 atomic_counter, local_accumulators_buffer,
-                                 tile_idx, cooperating_cu_start,
-                                 cooperating_cu_end);
+
+        // Store our own accumulators to memory. We don't know yet which CU will
+        // perform the final reduction. If it is not us, then it will need our
+        // local accumulators to have been stored to global memory. If it is us,
+        // then this store is potentially redundant, however:
+        // 1. Something needs to provide memory ordering on the local accumulator
+        //    accesses made by different CUs. At the moment, that thing is the
+        //    same barrier that also determines which CU does the final reduction.
+        //    If we try to potentially save the global store here, we will need
+        //    to add a second fence.
+        // 2. Trying to keep this in registers would mean more register pressure
+        //    and potentially a new constraint on kernel tile size choice.
+        // 3. Likewise if trying to keep that in shared memory.
+        acc_store(acc, local_accumulator);
+
+        atomic_t *atomic_counter = reinterpret_cast<atomic_t *>(
+          aux_bytes + tile_idx * atomics_alignment);
+
+        // Increment the atomic counter and agent-scope acquire-release fence.
+        // This has the effect of ordering the above accumulator store before
+        // the below accumulator loads across CUs ("agent scope").
+        int counter_value = workgroup_atomic_increment(atomic_counter);
+
+        // Determine if we are the CU that should perform the final reduction.
+        if (counter_value == cooperating_cu_count) {
+          // Perform the final reduction.
+          acc = final_reduction(M_outer, N_outer, K_outer,
+            local_accumulators_buffer,
+            tile_idx, cooperating_cu_start,
+            cooperating_cu_end);
+
+          // Reset the atomic counter to 0 so that the auxiliary buffer is ready to
+          // reuse in another kernel launch.
+          if (threadIdx.x == 0) {
+            *atomic_counter = 0;
+          }
+        }
       }
+
+      floatx4_t *C_ptr = static_cast<floatx4_t *>(C_data) +
+          MS * NS * 16 * 4 * (N_outer * m_outer + n_outer);
+
+      // Store the final accumulator to the destination.
+      // Note: consumer fusions go here.
+      acc_store(acc, C_ptr);
+
       iter = tile_iter_end;
     }
   }
+  // Helper to load accumulators from memory.
+  __device__ static acc_array_t acc_load(const floatx4_t* ptr) {
+    acc_array_t acc;
+    for (int i = 0; i < num_acc_vec4s; ++i) {
+      acc[i] = ptr[256 * i + threadIdx.x];
+    }
+    return acc;
+  }
+  // Helper to store accumulators to memory.
+  __device__ static void acc_store(acc_array_t acc, floatx4_t* ptr) {
+    for (int i = 0; i < num_acc_vec4s; ++i) {
+      ptr[256 * i + threadIdx.x] = acc[i];
+    }
+  }
+
   // Helper: inner MFMA loop. Similar to the MacLoop function given in
   // Algorithm 4 in https://arxiv.org/pdf/2301.03598.
-  __device__ static void mac_loop(const void *A_data, const void *B_data,
-                                  floatx4_t *C_ptr, int K_outer, int m_outer,
+  __device__ static acc_array_t mac_loop(const void *A_data, const void *B_data, int K_outer, int m_outer,
                                   int n_outer, int k_iter_start,
                                   int k_iter_end) {
     // Accumulator VGPRs.
-    floatx4_t acc[MS][NS / 4] = {{0}};
+    acc_array_t acc = {{0}};
     int tid = threadIdx.x;
     constexpr int A_tile_size_in_vec8 = MS * 16 * 4;
     constexpr int B_tile_size_in_vec8 = NS * 16 * 4;
@@ -2415,22 +2457,36 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
           float16x4_t a1 = (float16x4_t){a[4], a[5], a[6], a[7]};
           float16x4_t b0 = (float16x4_t){b[0], b[1], b[2], b[3]};
           float16x4_t b1 = (float16x4_t){b[4], b[5], b[6], b[7]};
-          acc[i][j] =
-              __builtin_amdgcn_mfma_f32_16x16x16f16(a0, b0, acc[i][j], 0, 0, 0);
-          acc[i][j] =
-              __builtin_amdgcn_mfma_f32_16x16x16f16(a1, b1, acc[i][j], 0, 0, 0);
+          floatx4_t acc0 = acc[i * (NS/4) + j];
+          acc0 =
+              __builtin_amdgcn_mfma_f32_16x16x16f16(a0, b0, acc0, 0, 0, 0);
+          acc0 =
+              __builtin_amdgcn_mfma_f32_16x16x16f16(a1, b1,acc0, 0, 0, 0);
+          acc[i * (NS/4) + j] = acc0;
         }
       }
       __syncthreads();
     }
-
-    // Store accumulator VGPRs to memory destination (might be either local
-    // accumulators or directly C matrix destination, depending on the caller).
-    for (int i = 0; i < MS; ++i) {
-      for (int j = 0; j < NS / 4; ++j) {
-        C_ptr[256 * (NS / 4 * i + j) + tid] = acc[i][j];
-      }
+    return acc;
+  }
+  __device__ static int workgroup_atomic_increment(atomic_t* atomic) {
+    __shared__ int workgroup_value;
+    int tid = threadIdx.x;
+    if (tid == 0) {
+      // Thread0 fetches and increments the device-wide atomic.
+      // This is a relaxed atomic, which is fine, as we provide the memory
+      // ordering separately below with __builtin_amdgcn_fence, which usefully
+      // allows us to specify the memory scope.
+      int thread0_value = 1 + atomicAdd(atomic, 1);
+      // Thread0 stores the value to the workgroup-wide shared location.
+      workgroup_value = thread0_value;
+      // Memory scope is "agent" because we need other workgroups to see this.
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
     }
+    // Now all threads in the workgroup load the workgroup-wide shared value.
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    return workgroup_value;
   }
   // Helper: maybe perform the final reduction of partial accumulators to the
   // destination C-matrix. The condition depends on atomic counter increments
@@ -2440,49 +2496,12 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
   // deterministic. This is achieved by deterministically looping over the
   // partial accumulators in order of increasing K-dimension indices, regardless
   // of which partial accumulators were computed earlier than others.
-  __device__ static void
-  maybe_do_final_reduction(floatx4_t *C_ptr, int M_outer, int N_outer,
-                           int K_outer, atomic_t *atomic_counter,
+  __device__ static acc_array_t
+  final_reduction(int M_outer, int N_outer,
+                           int K_outer,
                            float *local_accumulators_buffer, int tile_idx,
                            int cooperating_cu_start, int cooperating_cu_end) {
-    // We need to perform the atomic counter increment on one thread only, and
-    // then publish the result of that atomic increment to other threads in the
-    // workgroup. We use a __shared__ integer for that purpose.
-    __shared__ int workgroup_counter_value;
-    int tid = threadIdx.x;
-    if (tid == 0) {
-      // Thread0 fetches and increments the device-wide atomic_counter.
-      // This is a relaxed atomic, which is fine, as we provide the memory
-      // ordering separately below with __builtin_amdgcn_fence, which usefully
-      // allows us to specify the memory scope.
-      int thread0_counter_value = atomicAdd(atomic_counter, 1);
-      // Thread0 stores the value to the workgroup-wide shared location.
-      workgroup_counter_value = thread0_counter_value;
-      // Memory scope is "agent" because we need other workgroups to see this.
-      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-    }
-    // Now all threads in the workgroup load the workgroup-wide shared value.
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-    // Now we can determine, based on that atomic counter value, whether to
-    // return early or proceed with the final reduction.
-    if (workgroup_counter_value + 1 !=
-        cooperating_cu_end - cooperating_cu_start) {
-      // Return early: let another CU handle the final reduction.
-      return;
-    }
-    // Perform the final reduction on the current CU!
-    //
-    // Reset the atomic counter to 0 so that the auxiliary buffer is ready to
-    // reuse in another kernel launch.
-    if (threadIdx.x == 0) {
-      *atomic_counter = 0;
-    }
-    static constexpr int num_acc_vec4s = MS * NS / 4;
-    floatx4_t acc[num_acc_vec4s] = {0};
-    for (int i = 0; i < num_acc_vec4s; ++i) {
-      acc[i] = floatx4_t{0.f, 0.f, 0.f, 0.f};
-    }
+    acc_array_t acc = {0};
     // Sum the partial accumulators in deterministic order of increasing
     // compute unit index, which makes to determinisic order of increasing K
     // dimension index.
@@ -2497,13 +2516,10 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
           local_accumulators_buffer +
           other_local_accumulator_idx * static_M_tile * static_N_tile);
       for (int i = 0; i < num_acc_vec4s; ++i) {
-        acc[i] += other_accum_ptr[256 * i + tid];
+        acc[i] += other_accum_ptr[256 * i + threadIdx.x];
       }
     }
-    // Store to final destination.
-    for (int i = 0; i < num_acc_vec4s; ++i) {
-      C_ptr[256 * i + tid] = acc[i];
-    }
+    return acc;
   }
 };
 

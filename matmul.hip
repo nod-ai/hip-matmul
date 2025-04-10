@@ -4,7 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include <hip/hip_runtime.h>
+#include "common.hip"
 
 #include <cstdio>
 #include <cxxabi.h>
@@ -13,21 +13,9 @@
 #include <typeinfo>
 #include <vector>
 
-void hip_check_impl(hipError_t hip_error_code, const char *condstr,
-                    const char *file, int line) {
-  if (hip_error_code != hipSuccess) {
-    fprintf(stderr, "HIP Error \"%s\" produced by `%s` at %s:%d\n",
-            hipGetErrorString(hip_error_code), condstr, file, line);
-    exit(EXIT_FAILURE);
-  }
-}
 
-#define HIP_CHECK(expr) hip_check_impl(expr, #expr, __FILE__, __LINE__)
-
-int getIntEnvVar(const char *name, int default_val) {
-  const char *env = std::getenv(name);
-  return env ? std::stoi(env) : default_val;
-};
+typedef void (*mmt_func_t)(const void *, const void *, void *, void *, int, int,
+                           int);
 
 typedef int (*tile_layout_func_t)(int, int);
 
@@ -37,116 +25,102 @@ struct TiledMatrixShape {
   tile_layout_func_t tile_layout;
 };
 
-struct MNKShape {
-  int M, N, K;
-};
-
 struct TiledMmtShape {
   MNKShape outer, tile;
   tile_layout_func_t A_tile_layout, B_tile_layout, C_tile_layout;
 };
 
-__device__ __host__ TiledMatrixShape A_shape(const TiledMmtShape &s) {
+inline __device__ __host__ TiledMatrixShape A_shape(const TiledMmtShape &s) {
   return {s.outer.M, s.outer.K, s.tile.M, s.tile.K, s.A_tile_layout};
 }
 
-__device__ __host__ TiledMatrixShape B_shape(const TiledMmtShape &s) {
+inline __device__ __host__ TiledMatrixShape B_shape(const TiledMmtShape &s) {
   return {s.outer.N, s.outer.K, s.tile.N, s.tile.K, s.B_tile_layout};
 }
 
-__device__ __host__ TiledMatrixShape C_shape(const TiledMmtShape &s) {
+inline __device__ __host__ TiledMatrixShape C_shape(const TiledMmtShape &s) {
   return {s.outer.M, s.outer.N, s.tile.M, s.tile.N, s.C_tile_layout};
 }
 
-__device__ __host__ int flatsize(const TiledMatrixShape &s) {
+inline __device__ __host__ int flatsize(const TiledMatrixShape &s) {
   return s.rows_outer * s.cols_outer * s.rows_tile * s.cols_tile;
 }
 
-__device__ __host__ int offset(const TiledMatrixShape &s, int r_outer,
+inline __device__ __host__ int offset(const TiledMatrixShape &s, int r_outer,
                                int c_outer, int r_tile, int c_tile) {
   return s.tile_layout(r_tile, c_tile) +
          s.rows_tile * s.cols_tile * (c_outer + s.cols_outer * r_outer);
 }
 
-enum class Type { SI8, SI16, SI32, FP16, FP32 };
-
-const char *str(Type t) {
-  switch (t) {
-  case Type::SI8:
-    return "si8";
-  case Type::SI16:
-    return "si16";
-  case Type::SI32:
-    return "si32";
-  case Type::FP16:
-    return "fp16";
-  case Type::FP32:
-    return "fp32";
+// Base class for matrix-times-matrix-transposed ("mmt") kernels.
+// As the RHS is transposed, the dimensions are:
+// LHS = "A-matrix" : MxK
+// RHS = "B-matrix" : NxK
+// Accumulator = "C-matrix": MxN
+//
+// The data layout is tiled with tile sizes given by the {M,N,K}_tile methods
+// and tile layouts given by the {A,B,C}_layout methods.
+class MatvecKernel {
+public:
+  virtual ~MatvecKernel() {};
+  // Returns the element type of the A-matrix (LHS)
+  virtual Type A_type() const = 0;
+  // Returns the element type of the B-matrix (RHS)
+  virtual Type B_type() const = 0;
+  // Returns the element type of the C-matrix (accumulator/result)
+  virtual Type C_type() const = 0;
+  // Returns the M-dimension tile size (rows of accumulator)
+  virtual int M_tile() const = 0;
+  // Returns the N-dimension tile size (columns of accumulator)
+  virtual int N_tile() const = 0;
+  // Returns the K-dimension tile size (reduction dimension)
+  virtual int K_tile() const = 0;
+  // Returns the offset-computation function describing the A-matrix layout.
+  virtual tile_layout_func_t A_tile_layout() const = 0;
+  // Returns the offset-computation function describing the B-matrix layout.
+  virtual tile_layout_func_t B_tile_layout() const = 0;
+  // Returns the offset-computation function describing the C-matrix layout.
+  virtual tile_layout_func_t C_tile_layout() const = 0;
+  // Returns the number of threads that the kernel requires running on.
+  virtual int num_threads() const = 0;
+  // Returns a pointer to the device kernel.
+  virtual mmt_func_t mmt_func() const = 0;
+  // Optional: kernels may override this method to override the default grid.
+  virtual std::optional<dim3>
+  get_work_centric_grid(const MNKShape & /*outer*/) const {
+    return {};
   }
+  // Optional: kernels may override this to get an auxiliary device buffer of
+  // the given size in bytes.
+  virtual int aux_buffer_size(const MNKShape & /*outer*/) const { return 0; }
+};
+
+MNKShape getCheckProblemSize(const MatvecKernel &kernel) {
+  int M = getIntEnvVar("M", 4096);
+  int N = getIntEnvVar("N", 4096);
+  int K = getIntEnvVar("K", 4096);
+  MNKShape o;
+  o.M = std::max(1, M / kernel.M_tile());
+  o.N = std::max(1, N / kernel.N_tile());
+  o.K = std::max(1, K / kernel.K_tile());
+  return o;
 }
 
-__device__ __host__ int type_size(Type t) {
-  switch (t) {
-  case Type::SI8:
-    return 1;
-  case Type::SI16:
-    return 2;
-  case Type::SI32:
-    return 4;
-  case Type::FP16:
-    return 2;
-  case Type::FP32:
-    return 4;
-  }
+TiledMmtShape getTestShape(const MatvecKernel &kernel, const MNKShape &o) {
+  TiledMmtShape s;
+  s.outer = o;
+  s.tile.M = kernel.M_tile();
+  s.tile.N = kernel.N_tile();
+  s.tile.K = kernel.K_tile();
+  s.A_tile_layout = kernel.A_tile_layout();
+  s.B_tile_layout = kernel.B_tile_layout();
+  s.C_tile_layout = kernel.C_tile_layout();
+  return s;
 }
 
-template <Type t> struct CTypeImpl {};
-template <> struct CTypeImpl<Type::SI8> {
-  using type = int8_t;
-};
-template <> struct CTypeImpl<Type::SI16> {
-  using type = int16_t;
-};
-template <> struct CTypeImpl<Type::SI32> {
-  using type = int32_t;
-};
-template <> struct CTypeImpl<Type::FP16> {
-  using type = _Float16;
-};
-template <> struct CTypeImpl<Type::FP32> {
-  using type = float;
-};
-template <Type t> using CType = typename CTypeImpl<t>::type;
-
-template <Type type>
-void fillRandomBuffer(int size, std::minstd_rand &r, void *out_buffer) {
-  using T = CType<type>;
-  T *out_buffer_typed = static_cast<T *>(out_buffer);
-  for (int i = 0; i < size; ++i) {
-    // Generate small integers in [-2, +2] so products are in [-4, +4] so
-    // accumulators are in [-4K, +4K] for accumulation depth K so they're
-    // exactly representable, float rounding is exact and we don't need
-    // fuzzy compares.
-    out_buffer_typed[i] = static_cast<T>(static_cast<int>((r() % 5)) - 2);
-  }
-}
-
-std::vector<std::byte> makeRandomBuffer(Type type, int size,
-                                        std::minstd_rand &r) {
-  int bytes = size * type_size(type);
-  std::vector<std::byte> result(bytes);
-  if (type == Type::SI8) {
-    fillRandomBuffer<Type::SI8>(size, r, result.data());
-  } else if (type == Type::SI16) {
-    fillRandomBuffer<Type::SI16>(size, r, result.data());
-  } else if (type == Type::SI32) {
-    fillRandomBuffer<Type::SI32>(size, r, result.data());
-  } else if (type == Type::FP16) {
-    fillRandomBuffer<Type::FP16>(size, r, result.data());
-  } else if (type == Type::FP32) {
-    fillRandomBuffer<Type::FP32>(size, r, result.data());
-  }
-  return result;
+dim3 getLaunchGrid(const MatvecKernel &kernel, const TiledMmtShape &s) {
+  return kernel.get_work_centric_grid(s.outer).value_or(
+      dim3(s.outer.M, s.outer.N));
 }
 
 template <Type A_type, Type B_type, Type C_type>
@@ -211,81 +185,7 @@ void checkMmtResults(Type A_type, Type B_type, Type C_type,
   abort();
 }
 
-typedef void (*mmt_func_t)(const void *, const void *, void *, void *, int, int,
-                           int);
-
-// Base class for matrix-times-matrix-transposed ("mmt") kernels.
-// As the RHS is transposed, the dimensions are:
-// LHS = "A-matrix" : MxK
-// RHS = "B-matrix" : NxK
-// Accumulator = "C-matrix": MxN
-//
-// The data layout is tiled with tile sizes given by the {M,N,K}_tile methods
-// and tile layouts given by the {A,B,C}_layout methods.
-class MmtKernel {
-public:
-  virtual ~MmtKernel() {};
-  // Returns the element type of the A-matrix (LHS)
-  virtual Type A_type() const = 0;
-  // Returns the element type of the B-matrix (RHS)
-  virtual Type B_type() const = 0;
-  // Returns the element type of the C-matrix (accumulator/result)
-  virtual Type C_type() const = 0;
-  // Returns the M-dimension tile size (rows of accumulator)
-  virtual int M_tile() const = 0;
-  // Returns the N-dimension tile size (columns of accumulator)
-  virtual int N_tile() const = 0;
-  // Returns the K-dimension tile size (reduction dimension)
-  virtual int K_tile() const = 0;
-  // Returns the offset-computation function describing the A-matrix layout.
-  virtual tile_layout_func_t A_tile_layout() const = 0;
-  // Returns the offset-computation function describing the B-matrix layout.
-  virtual tile_layout_func_t B_tile_layout() const = 0;
-  // Returns the offset-computation function describing the C-matrix layout.
-  virtual tile_layout_func_t C_tile_layout() const = 0;
-  // Returns the number of threads that the kernel requires running on.
-  virtual int num_threads() const = 0;
-  // Returns a pointer to the device kernel.
-  virtual mmt_func_t mmt_func() const = 0;
-  // Optional: kernels may override this method to override the default grid.
-  virtual std::optional<dim3>
-  get_work_centric_grid(const MNKShape & /*outer*/) const {
-    return {};
-  }
-  // Optional: kernels may override this to get an auxiliary device buffer of
-  // the given size in bytes.
-  virtual int aux_buffer_size(const MNKShape & /*outer*/) const { return 0; }
-};
-
-MNKShape getBenchmarkMNKShape(const MmtKernel &kernel) {
-  int M = getIntEnvVar("M", 4096);
-  int N = getIntEnvVar("N", 4096);
-  int K = getIntEnvVar("K", 4096);
-  MNKShape o;
-  o.M = std::max(1, M / kernel.M_tile());
-  o.N = std::max(1, N / kernel.N_tile());
-  o.K = std::max(1, K / kernel.K_tile());
-  return o;
-}
-
-TiledMmtShape getTestShape(const MmtKernel &kernel, const MNKShape &o) {
-  TiledMmtShape s;
-  s.outer = o;
-  s.tile.M = kernel.M_tile();
-  s.tile.N = kernel.N_tile();
-  s.tile.K = kernel.K_tile();
-  s.A_tile_layout = kernel.A_tile_layout();
-  s.B_tile_layout = kernel.B_tile_layout();
-  s.C_tile_layout = kernel.C_tile_layout();
-  return s;
-}
-
-dim3 getLaunchGrid(const MmtKernel &kernel, const TiledMmtShape &s) {
-  return kernel.get_work_centric_grid(s.outer).value_or(
-      dim3(s.outer.M, s.outer.N));
-}
-
-void check(const MmtKernel &kernel, const MNKShape &o) {
+void check(const MatvecKernel &kernel, const MNKShape &o) {
   TiledMmtShape s = getTestShape(kernel, o);
   std::minstd_rand random_engine;
   std::vector<std::byte> A_host_data =
@@ -340,7 +240,7 @@ void check(const MmtKernel &kernel, const MNKShape &o) {
   HIP_CHECK(hipFree(shape_device_buffer));
 }
 
-void check(const MmtKernel &kernel) {
+void check(const MatvecKernel &kernel) {
   std::printf("  Checking correctness... ");
   // Test with more generic shapes than just M==N==K==2^x.
   for (MNKShape o : {MNKShape{1, 1, 1}, MNKShape{2, 1, 1}, MNKShape{1, 2, 1},
@@ -353,7 +253,7 @@ void check(const MmtKernel &kernel) {
   std::printf("OK\n");
 }
 
-void benchmark(const MmtKernel &kernel, const MNKShape &o) {
+void benchmark(const MatvecKernel &kernel, const MNKShape &o) {
   TiledMmtShape s = getTestShape(kernel, o);
   std::printf("  Benchmarking: total MxNxK=%dx%dx%d, outer MxNxK=%dx%dx%d ... ",
               s.outer.M * s.tile.M, s.outer.N * s.tile.N, s.outer.K * s.tile.K,
@@ -447,7 +347,7 @@ void benchmark(const MmtKernel &kernel, const MNKShape &o) {
   HIP_CHECK(hipFree(shape_device_buffer));
 }
 
-void test(const MmtKernel &kernel) {
+void test(const MatvecKernel &kernel) {
   char *name =
       abi::__cxa_demangle(typeid(kernel).name(), nullptr, nullptr, nullptr);
   const char *filter = getenv("FILTER");
@@ -464,13 +364,13 @@ void test(const MmtKernel &kernel) {
     check(kernel);
   }
 
-  MNKShape o = getBenchmarkMNKShape(kernel);
+  MNKShape o = getCheckProblemSize(kernel);
   benchmark(kernel, o);
 }
 
 template <Type T_A_type, Type T_B_type, Type T_C_type, int T_M_tile,
           int T_N_tile, int T_K_tile>
-class MmtKernel_generic : public MmtKernel {
+class MmtKernel_generic : public MatvecKernel {
   virtual Type A_type() const override { return T_A_type; }
   virtual Type B_type() const override { return T_B_type; }
   virtual Type C_type() const override { return T_C_type; }
@@ -519,7 +419,7 @@ class MmtKernel_generic : public MmtKernel {
   }
 };
 
-class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MmtKernel {
+class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MatvecKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -573,7 +473,7 @@ class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MmtKernel {
 };
 
 class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC
-    : public MmtKernel {
+    : public MatvecKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -622,7 +522,7 @@ class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC
   }
 };
 
-class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
+class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct : public MatvecKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -666,7 +566,7 @@ class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   }
 };
 
-class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4 : public MmtKernel {
+class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4 : public MatvecKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -718,7 +618,7 @@ class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4 : public MmtKernel {
 };
 
 class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4
-    : public MmtKernel {
+    : public MatvecKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -796,7 +696,7 @@ class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4
   }
 };
 
-class MmtKernel_128t_1x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
+class MmtKernel_128t_1x2_amdgcn_mfma_f32_16x16x4f32_direct : public MatvecKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -848,7 +748,7 @@ class MmtKernel_128t_1x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   }
 };
 
-class MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
+class MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_direct : public MatvecKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -907,7 +807,7 @@ class MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   }
 };
 
-class MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
+class MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_shared : public MatvecKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -1042,7 +942,7 @@ class MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB
-    : public MmtKernel {
+    : public MatvecKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
@@ -1182,7 +1082,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared
-    : public MmtKernel {
+    : public MatvecKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
@@ -1337,7 +1237,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4
-    : public MmtKernel {
+    : public MatvecKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
@@ -1429,7 +1329,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_subgroup2x2
-    : public MmtKernel {
+    : public MatvecKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
@@ -1523,7 +1423,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_subgroup2x2
 template <int MS, int NS>
 class
     MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_doublebuffer_naive
-    : public MmtKernel {
+    : public MatvecKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
@@ -1643,7 +1543,7 @@ class
 template <int MS, int NS>
 class
     MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_doublebuffer_take2
-    : public MmtKernel {
+    : public MatvecKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
@@ -1756,7 +1656,7 @@ class
 
 template <int MS, int NS>
 class MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4
-    : public MmtKernel {
+    : public MatvecKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
@@ -1854,7 +1754,7 @@ class MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4
 template <int MS, int NS>
 class
     MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_misguidednobankconflicts
-    : public MmtKernel {
+    : public MatvecKernel {
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
@@ -1954,7 +1854,7 @@ class
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared
-    : public MmtKernel {
+    : public MatvecKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP16; }
@@ -2046,7 +1946,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
-    : public MmtKernel {
+    : public MatvecKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP16; }
@@ -2145,15 +2045,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
   }
 };
 
-template <typename A, typename B>
-__device__ __host__ std::common_type_t<A, B> ceil_div(A a, B b) {
-  return (a + b - 1) / b;
-}
 
-template <int Po2, typename A> __device__ __host__ A round_up_to_po2(A a) {
-  static_assert(Po2 > 0 && (Po2 & (Po2 - 1)) == 0);
-  return ((a - 1) | (Po2 - 1)) + 1;
-}
 
 // A simple Stream-K kernel variant of
 // MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2.
@@ -2176,7 +2068,7 @@ template <int Po2, typename A> __device__ __host__ A round_up_to_po2(A a) {
 //
 template <int MS, int NS>
 class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
-    : public MmtKernel {
+    : public MatvecKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   // Defining some values as constants as they will be needed in static methods
@@ -2515,7 +2407,7 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_32x32x16i8_shared
-    : public MmtKernel {
+    : public MatvecKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::SI8; }
@@ -2607,7 +2499,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_32x32x16i8_shared
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
-    : public MmtKernel {
+    : public MatvecKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::SI8; }
@@ -2698,7 +2590,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2
-    : public MmtKernel {
+    : public MatvecKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::SI8; }
@@ -2793,7 +2685,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload
-    : public MmtKernel {
+    : public MatvecKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::SI8; }
@@ -2925,7 +2817,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipeline_v3
-    : public MmtKernel {
+    : public MatvecKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::SI8; }

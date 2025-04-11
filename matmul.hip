@@ -420,21 +420,23 @@ void benchmark(const MmtKernel &kernel, const MNKShape &o) {
     }
     iterations *= 2;
   }
+
+  // Calculate the actual amount of memory read during the calculation, taking
+  // into account the tile sizes.
+  float A_element_bytes = type_size(kernel.A_type());
+  float B_element_bytes = type_size(kernel.B_type());
+  float MNK = static_cast<float>(s.outer.M) * s.outer.N * s.outer.K;
+  float kernel_bytes_read = MNK * ((A_element_bytes * s.tile.M * s.tile.K) +
+                                   (B_element_bytes * s.tile.N * s.tile.K));
+
   float kernel_ms = elapsed_ms / iterations;
   float kernel_ops =
       2.f * s.outer.M * s.outer.N * s.outer.K * s.tile.M * s.tile.N * s.tile.K;
-  int A_element_bytes = type_size(kernel.A_type());
-  int B_element_bytes = type_size(kernel.B_type());
-  float A_bytes_read = static_cast<float>(
-      A_element_bytes * (s.outer.M * s.tile.M) * (s.outer.K * s.tile.K));
-  float B_bytes_read = static_cast<float>(
-      B_element_bytes * (s.outer.N * s.tile.N) * (s.outer.K * s.tile.K));
-  float kernel_bytes_read = A_bytes_read + B_bytes_read;
   float kernel_ops_per_s = 1000.f * kernel_ops / kernel_ms;
   float kernel_bytes_read_per_s = 1000.f * kernel_bytes_read / kernel_ms;
-  std::printf("%.4g Tflop/s, read %.4g TB/s, iterations=%d\n",
+  std::printf("%.4g Tflop/s, read %.4g TB/s, latency %.2g ms, iterations=%d\n",
               1.e-12f * kernel_ops_per_s, 1e-12f * kernel_bytes_read_per_s,
-              iterations);
+              kernel_ms, iterations);
 
   HIP_CHECK(hipEventDestroy(start));
   HIP_CHECK(hipEventDestroy(stop));

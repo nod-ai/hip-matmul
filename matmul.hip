@@ -423,9 +423,13 @@ void benchmark(const MmtKernel &kernel, const MNKShape &o) {
   float kernel_ms = elapsed_ms / iterations;
   float kernel_ops =
       2.f * s.outer.M * s.outer.N * s.outer.K * s.tile.M * s.tile.N * s.tile.K;
-  float kernel_bytes_read = static_cast<float>(sizeof(float)) * s.outer.M *
-                            s.outer.N * s.outer.K * (s.tile.M + s.tile.N) *
-                            s.tile.K;
+  int A_element_bytes = type_size(kernel.A_type());
+  int B_element_bytes = type_size(kernel.B_type());
+  float A_bytes_read = static_cast<float>(
+      A_element_bytes * (s.outer.M * s.tile.M) * (s.outer.K * s.tile.K));
+  float B_bytes_read = static_cast<float>(
+      B_element_bytes * (s.outer.N * s.tile.N) * (s.outer.K * s.tile.K));
+  float kernel_bytes_read = A_bytes_read + B_bytes_read;
   float kernel_ops_per_s = 1000.f * kernel_ops / kernel_ms;
   float kernel_bytes_read_per_s = 1000.f * kernel_bytes_read / kernel_ms;
   std::printf("%.4g Tflop/s, read %.4g TB/s, iterations=%d\n",

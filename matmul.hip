@@ -94,7 +94,7 @@ public:
   virtual int aux_buffer_size(const MNKShape & /*outer*/) const { return 0; }
 };
 
-MNKShape getCheckProblemSize(const MmtKernel &kernel) {
+MNKShape getBenchmarkMNKShape(const MmtKernel &kernel) {
   int M = getIntEnvVar("M", 4096);
   int N = getIntEnvVar("N", 4096);
   int K = getIntEnvVar("K", 4096);
@@ -363,7 +363,7 @@ void test(const MmtKernel &kernel) {
     check(kernel);
   }
 
-  MNKShape o = getCheckProblemSize(kernel);
+  MNKShape o = getBenchmarkMNKShape(kernel);
   benchmark(kernel, o);
 }
 

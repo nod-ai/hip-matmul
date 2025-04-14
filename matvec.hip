@@ -28,20 +28,20 @@ void print(const ProblemSize &problem, FILE *file = stderr) {
   fprintf(file, "A:%s, B:%s, C:%s, Total MxNxK=%dx%dx%d\n", str(problem.A_type),
           str(problem.B_type), str(problem.C_type), problem.total.M,
           problem.total.N, problem.total.K);
-  fprintf(file, "\tOuter MxNxK=%dx%dx%d, Tile MxNxK=%dx%dx%d\n", problem.outer.M,
-          problem.outer.N, problem.outer.K, problem.tile.M, problem.tile.N,
-          problem.tile.K);
+  fprintf(file, "\tOuter MxNxK=%dx%dx%d, Tile MxNxK=%dx%dx%d\n",
+          problem.outer.M, problem.outer.N, problem.outer.K, problem.tile.M,
+          problem.tile.N, problem.tile.K);
 }
 
-int flat_a_size(const ProblemSize& problem) {
+int flat_a_size(const ProblemSize &problem) {
   return type_size(problem.A_type) * problem.total.M * problem.total.K;
 }
 
-int flat_b_size(const ProblemSize& problem) {
+int flat_b_size(const ProblemSize &problem) {
   return type_size(problem.B_type) * problem.total.N * problem.total.K;
 }
 
-int flat_c_size(const ProblemSize& problem) {
+int flat_c_size(const ProblemSize &problem) {
   return type_size(problem.C_type) * problem.total.M * problem.total.N;
 }
 
@@ -111,8 +111,7 @@ void checkMatvecResults(const void *A_data_void, const void *B_data_void,
             }
           }
           TC expected = c;
-          TC actual =
-              C_data[global_m * problem.total.N + global_n];
+          TC actual = C_data[global_m * problem.total.N + global_n];
           if (actual != expected) {
             fprintf(stderr,
                     "matmul numerical error: actual(%g) != "
@@ -344,15 +343,11 @@ void test(const MatvecKernel &kernel) {
     check(kernel);
   }
 
-  MNKShape test_shapes[] = {{14336, 1, 4096},
-                            {4096, 1, 14336},
-                            {4096, 1, 4096},
-                            {1024, 1, 4096}};
+  MNKShape test_shapes[] = {
+      {14336, 1, 4096}, {4096, 1, 14336}, {4096, 1, 4096}, {1024, 1, 4096}};
   for (MNKShape shape : test_shapes) {
     benchmark(kernel, shape);
   }
 }
 
-int main() {
-  test(NaiveMatmulKernel{});
-}
+int main() { test(NaiveMatmulKernel{}); }

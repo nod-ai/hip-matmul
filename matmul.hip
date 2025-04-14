@@ -13,7 +13,6 @@
 #include <typeinfo>
 #include <vector>
 
-
 typedef void (*mmt_func_t)(const void *, const void *, void *, void *, int, int,
                            int);
 
@@ -30,23 +29,23 @@ struct TiledMmtShape {
   tile_layout_func_t A_tile_layout, B_tile_layout, C_tile_layout;
 };
 
-inline __device__ __host__ TiledMatrixShape A_shape(const TiledMmtShape &s) {
+__device__ __host__ TiledMatrixShape A_shape(const TiledMmtShape &s) {
   return {s.outer.M, s.outer.K, s.tile.M, s.tile.K, s.A_tile_layout};
 }
 
-inline __device__ __host__ TiledMatrixShape B_shape(const TiledMmtShape &s) {
+__device__ __host__ TiledMatrixShape B_shape(const TiledMmtShape &s) {
   return {s.outer.N, s.outer.K, s.tile.N, s.tile.K, s.B_tile_layout};
 }
 
-inline __device__ __host__ TiledMatrixShape C_shape(const TiledMmtShape &s) {
+__device__ __host__ TiledMatrixShape C_shape(const TiledMmtShape &s) {
   return {s.outer.M, s.outer.N, s.tile.M, s.tile.N, s.C_tile_layout};
 }
 
-inline __device__ __host__ int flatsize(const TiledMatrixShape &s) {
+__device__ __host__ int flatsize(const TiledMatrixShape &s) {
   return s.rows_outer * s.cols_outer * s.rows_tile * s.cols_tile;
 }
 
-inline __device__ __host__ int offset(const TiledMatrixShape &s, int r_outer,
+__device__ __host__ int offset(const TiledMatrixShape &s, int r_outer,
                                int c_outer, int r_tile, int c_tile) {
   return s.tile_layout(r_tile, c_tile) +
          s.rows_tile * s.cols_tile * (c_outer + s.cols_outer * r_outer);
@@ -60,9 +59,9 @@ inline __device__ __host__ int offset(const TiledMatrixShape &s, int r_outer,
 //
 // The data layout is tiled with tile sizes given by the {M,N,K}_tile methods
 // and tile layouts given by the {A,B,C}_layout methods.
-class MatvecKernel {
+class MmtKernel {
 public:
-  virtual ~MatvecKernel() {};
+  virtual ~MmtKernel() {};
   // Returns the element type of the A-matrix (LHS)
   virtual Type A_type() const = 0;
   // Returns the element type of the B-matrix (RHS)
@@ -95,7 +94,7 @@ public:
   virtual int aux_buffer_size(const MNKShape & /*outer*/) const { return 0; }
 };
 
-MNKShape getCheckProblemSize(const MatvecKernel &kernel) {
+MNKShape getCheckProblemSize(const MmtKernel &kernel) {
   int M = getIntEnvVar("M", 4096);
   int N = getIntEnvVar("N", 4096);
   int K = getIntEnvVar("K", 4096);
@@ -106,7 +105,7 @@ MNKShape getCheckProblemSize(const MatvecKernel &kernel) {
   return o;
 }
 
-TiledMmtShape getTestShape(const MatvecKernel &kernel, const MNKShape &o) {
+TiledMmtShape getTestShape(const MmtKernel &kernel, const MNKShape &o) {
   TiledMmtShape s;
   s.outer = o;
   s.tile.M = kernel.M_tile();
@@ -118,7 +117,7 @@ TiledMmtShape getTestShape(const MatvecKernel &kernel, const MNKShape &o) {
   return s;
 }
 
-dim3 getLaunchGrid(const MatvecKernel &kernel, const TiledMmtShape &s) {
+dim3 getLaunchGrid(const MmtKernel &kernel, const TiledMmtShape &s) {
   return kernel.get_work_centric_grid(s.outer).value_or(
       dim3(s.outer.M, s.outer.N));
 }
@@ -185,7 +184,7 @@ void checkMmtResults(Type A_type, Type B_type, Type C_type,
   abort();
 }
 
-void check(const MatvecKernel &kernel, const MNKShape &o) {
+void check(const MmtKernel &kernel, const MNKShape &o) {
   TiledMmtShape s = getTestShape(kernel, o);
   std::minstd_rand random_engine;
   std::vector<std::byte> A_host_data =
@@ -240,7 +239,7 @@ void check(const MatvecKernel &kernel, const MNKShape &o) {
   HIP_CHECK(hipFree(shape_device_buffer));
 }
 
-void check(const MatvecKernel &kernel) {
+void check(const MmtKernel &kernel) {
   std::printf("  Checking correctness... ");
   // Test with more generic shapes than just M==N==K==2^x.
   for (MNKShape o : {MNKShape{1, 1, 1}, MNKShape{2, 1, 1}, MNKShape{1, 2, 1},
@@ -253,7 +252,7 @@ void check(const MatvecKernel &kernel) {
   std::printf("OK\n");
 }
 
-void benchmark(const MatvecKernel &kernel, const MNKShape &o) {
+void benchmark(const MmtKernel &kernel, const MNKShape &o) {
   TiledMmtShape s = getTestShape(kernel, o);
   std::printf("  Benchmarking: total MxNxK=%dx%dx%d, outer MxNxK=%dx%dx%d ... ",
               s.outer.M * s.tile.M, s.outer.N * s.tile.N, s.outer.K * s.tile.K,
@@ -347,7 +346,7 @@ void benchmark(const MatvecKernel &kernel, const MNKShape &o) {
   HIP_CHECK(hipFree(shape_device_buffer));
 }
 
-void test(const MatvecKernel &kernel) {
+void test(const MmtKernel &kernel) {
   char *name =
       abi::__cxa_demangle(typeid(kernel).name(), nullptr, nullptr, nullptr);
   const char *filter = getenv("FILTER");
@@ -370,7 +369,7 @@ void test(const MatvecKernel &kernel) {
 
 template <Type T_A_type, Type T_B_type, Type T_C_type, int T_M_tile,
           int T_N_tile, int T_K_tile>
-class MmtKernel_generic : public MatvecKernel {
+class MmtKernel_generic : public MmtKernel {
   virtual Type A_type() const override { return T_A_type; }
   virtual Type B_type() const override { return T_B_type; }
   virtual Type C_type() const override { return T_C_type; }
@@ -419,7 +418,7 @@ class MmtKernel_generic : public MatvecKernel {
   }
 };
 
-class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MatvecKernel {
+class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MmtKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -473,7 +472,7 @@ class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_rowmajor : public MatvecKernel {
 };
 
 class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC
-    : public MatvecKernel {
+    : public MmtKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -522,7 +521,7 @@ class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_directAB_rowmajorC
   }
 };
 
-class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct : public MatvecKernel {
+class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -566,7 +565,7 @@ class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct : public MatvecKernel {
   }
 };
 
-class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4 : public MatvecKernel {
+class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4 : public MmtKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -618,7 +617,7 @@ class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4 : public MatvecKernel 
 };
 
 class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4
-    : public MatvecKernel {
+    : public MmtKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -696,7 +695,7 @@ class MmtKernel_64t_amdgcn_mfma_f32_16x16x4f32_direct_Kx4_unrollx4
   }
 };
 
-class MmtKernel_128t_1x2_amdgcn_mfma_f32_16x16x4f32_direct : public MatvecKernel {
+class MmtKernel_128t_1x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -748,7 +747,7 @@ class MmtKernel_128t_1x2_amdgcn_mfma_f32_16x16x4f32_direct : public MatvecKernel
   }
 };
 
-class MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_direct : public MatvecKernel {
+class MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_direct : public MmtKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -807,7 +806,7 @@ class MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_direct : public MatvecKernel
   }
 };
 
-class MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_shared : public MatvecKernel {
+class MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_shared : public MmtKernel {
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
   virtual Type C_type() const override { return Type::FP32; }
@@ -942,7 +941,7 @@ class MmtKernel_256t_2x2_amdgcn_mfma_f32_16x16x4f32_shared : public MatvecKernel
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB
-    : public MatvecKernel {
+    : public MmtKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
@@ -1082,7 +1081,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_directA_sharedB
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared
-    : public MatvecKernel {
+    : public MmtKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
@@ -1237,7 +1236,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4
-    : public MatvecKernel {
+    : public MmtKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
@@ -1329,7 +1328,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_subgroup2x2
-    : public MatvecKernel {
+    : public MmtKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
@@ -1423,7 +1422,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_subgroup2x2
 template <int MS, int NS>
 class
     MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_doublebuffer_naive
-    : public MatvecKernel {
+    : public MmtKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
@@ -1543,7 +1542,7 @@ class
 template <int MS, int NS>
 class
     MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_doublebuffer_take2
-    : public MatvecKernel {
+    : public MmtKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
@@ -1656,7 +1655,7 @@ class
 
 template <int MS, int NS>
 class MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4
-    : public MatvecKernel {
+    : public MmtKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
@@ -1754,7 +1753,7 @@ class MmtKernel_1024t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4
 template <int MS, int NS>
 class
     MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x4f32_shared_Kx4_misguidednobankconflicts
-    : public MatvecKernel {
+    : public MmtKernel {
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP32; }
   virtual Type B_type() const override { return Type::FP32; }
@@ -1854,7 +1853,7 @@ class
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared
-    : public MatvecKernel {
+    : public MmtKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP16; }
@@ -1946,7 +1945,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
-    : public MatvecKernel {
+    : public MmtKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::FP16; }
@@ -2045,8 +2044,6 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
   }
 };
 
-
-
 // A simple Stream-K kernel variant of
 // MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2.
 //
@@ -2068,7 +2065,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
 //
 template <int MS, int NS>
 class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
-    : public MatvecKernel {
+    : public MmtKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   // Defining some values as constants as they will be needed in static methods
@@ -2407,7 +2404,7 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_32x32x16i8_shared
-    : public MatvecKernel {
+    : public MmtKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::SI8; }
@@ -2499,7 +2496,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_32x32x16i8_shared
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
-    : public MatvecKernel {
+    : public MmtKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::SI8; }
@@ -2590,7 +2587,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2
-    : public MatvecKernel {
+    : public MmtKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::SI8; }
@@ -2685,7 +2682,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload
-    : public MatvecKernel {
+    : public MmtKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::SI8; }
@@ -2817,7 +2814,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipelineload
 
 template <int MS, int NS>
 class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipeline_v3
-    : public MatvecKernel {
+    : public MmtKernel {
   static_assert(MS >= 4 && !(MS % 4));
   static_assert(NS >= 4 && !(NS % 4));
   virtual Type A_type() const override { return Type::SI8; }

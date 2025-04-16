@@ -2339,6 +2339,12 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
 
       int cooperating_cu_count = cooperating_cu_end - cooperating_cu_start;
 
+      // Track whether we will ultimately perform the store of the final
+      // accumulator. This is always true, except when cooperating with other
+      // CUs on the tile AND determining that another CU will be the one doing
+      // the final reduction.
+      bool should_store_final_accumulator = true;
+
       // Hard case: cooperating with other CUs on this tile.
       if (cooperating_cu_count != 1) {
         int cu_idx_in_cooperating_group = cu - cooperating_cu_start;
@@ -2385,15 +2391,20 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
           if (threadIdx.x == 0) {
             *atomic_counter = 0;
           }
+        } else {
+          // Not performing the final reduction, so also not doing the store.
+          should_store_final_accumulator = false;
         }
       }
 
       floatx4_t *C_ptr = static_cast<floatx4_t *>(C_data) +
           MS * NS * 16 * 4 * (N_outer * m_outer + n_outer);
 
-      // Store the final accumulator to the destination.
-      // Note: consumer fusions go here.
-      acc_store(acc, C_ptr);
+      if (should_store_final_accumulator) {
+        // Store the final accumulator to the destination.
+        // Note: consumer fusions go here.
+        acc_store(acc, C_ptr);
+      }
 
       iter = tile_iter_end;
     }

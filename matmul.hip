@@ -2226,7 +2226,7 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
   //
   // Maximum number of Compute Units that we aim to use on sufficiently large
   // problems. This value assumes a MI300X in SPX mode.
-  static constexpr int MaxCUs = 304;
+  static constexpr int MaxWorkgroups = 304;
   // Alignment to use when coalescing device buffers to avoid alignment-related
   // performance caveats.
   static constexpr int device_alignment = 128;
@@ -2234,9 +2234,9 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
   static constexpr int atomics_alignment = 128;
   // Returns the number of Compute Units that we aim to use for the problem
   // shape with given `outer` shape (expressed in units of this kernel's tiles).
-  static __device__ __host__ int get_cu_count(const MNKShape &outer) {
+  static __device__ __host__ int get_workgroup_count(const MNKShape &outer) {
     int64_t total_iters = static_cast<int64_t>(outer.M) * outer.N * outer.K;
-    return std::min(static_cast<int64_t>(MaxCUs), total_iters);
+    return std::min(static_cast<int64_t>(MaxWorkgroups), total_iters);
   }
   static __device__ __host__ int get_tile_count(const MNKShape &outer) {
     return outer.M * outer.N;
@@ -2254,7 +2254,7 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
   // refined to trim memory usage.
   static __device__ __host__ int
   local_accumulators_count_per_tile(const MNKShape &outer) {
-    return 1 + ceil_div(get_cu_count(outer), get_tile_count(outer));
+    return 1 + ceil_div(get_workgroup_count(outer), get_tile_count(outer));
   }
   // Return the overall number of local accumulator buffers to allocate in the
   // auxiliary buffer. This value is a coarse upper bound, could be
@@ -2274,7 +2274,7 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
   // grid.
   virtual std::optional<dim3>
   get_work_centric_grid(const MNKShape &outer) const override {
-    return {get_cu_count(outer)};
+    return {get_workgroup_count(outer)};
   }
   // Standard MmtKernel interface method override describing the auxiliary
   // buffer size to allocate.
@@ -2304,15 +2304,14 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
     float *local_accumulators_buffer =
         reinterpret_cast<float *>(aux_bytes + atomics_buffer_size(outer));
     // General arithmetic just like in Algorithm 5 in
-    // https://arxiv.org/pdf/2301.03598, except we use the AMD term "CU" for
-    // "Compute Unit" instead of "CTA".
+    // https://arxiv.org/pdf/2301.03598, except we use the term "workgroup" instead of "CTA".
     int iters_per_tile = K_outer;
     int total_tiles = M_outer * N_outer;
     int total_iters = total_tiles * iters_per_tile;
-    int cu_count = get_cu_count(outer);
-    int cu = blockIdx.x;
-    int iter_start = cu * total_iters / cu_count;
-    int iter_end = (cu + 1) * total_iters / cu_count;
+    int workgroup_count = get_workgroup_count(outer);
+    int workgroup = blockIdx.x;
+    int iter_start = workgroup * total_iters / workgroup_count;
+    int iter_end = (workgroup + 1) * total_iters / workgroup_count;
     int iter = iter_start;
     // Work-centric loop on iterations to be handled by this compute unit.
     while (iter < iter_end) {
@@ -2337,38 +2336,38 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
       // The next step is specific to our wait-free atomic approach: we need to
       // know the interval of other compute units cooperating with the current
       // compute unit on the current tile.
-      int cooperating_cu_start =
-          ceil_div((tile_iter_start + 1) * cu_count, total_iters) - 1;
-      int cooperating_cu_end = ceil_div(tile_iter_end * cu_count, total_iters);
-      assert(cu >= cooperating_cu_start);
-      assert(cu < cooperating_cu_end);
+      int cooperating_workgroup_start =
+          ceil_div((tile_iter_start + 1) * workgroup_count, total_iters) - 1;
+      int cooperating_workgroup_end = ceil_div(tile_iter_end * workgroup_count, total_iters);
+      assert(workgroup >= cooperating_workgroup_start);
+      assert(workgroup < cooperating_workgroup_end);
 
-      int cooperating_cu_count = cooperating_cu_end - cooperating_cu_start;
+      int cooperating_workgroup_count = cooperating_workgroup_end - cooperating_workgroup_start;
 
       // Track whether we will ultimately perform the store of the final
       // accumulator. This is always true, except when cooperating with other
-      // CUs on the tile AND determining that another CU will be the one doing
+      // workgroups on the tile AND determining that another workgroup will be the one doing
       // the final reduction.
       bool should_store_final_accumulator = true;
 
-      // Hard case: cooperating with other CUs on this tile.
-      if (cooperating_cu_count != 1) {
-        int cu_idx_in_cooperating_group = cu - cooperating_cu_start;
+      // Hard case: cooperating with other workgroups on this tile.
+      if (cooperating_workgroup_count != 1) {
+        int workgroup_idx_in_cooperating_group = workgroup - cooperating_workgroup_start;
         int local_accumulator_idx =
-            cu_idx_in_cooperating_group +
+            workgroup_idx_in_cooperating_group +
             tile_idx * local_accumulators_count_per_tile(
                             MNKShape{M_outer, N_outer, K_outer});
         floatx4_t *local_accumulator = reinterpret_cast<floatx4_t *>(
             local_accumulators_buffer +
             local_accumulator_idx * static_M_tile * static_N_tile);
 
-        // Store our own accumulators to memory. We don't know yet which CU will
+        // Store our own accumulators to memory. We don't know yet which workgroup will
         // perform the final reduction. If it is not us, then it will need our
         // local accumulators to have been stored to global memory. If it is us,
         // then this store is potentially redundant, however:
         // 1. Something needs to provide memory ordering on the local accumulator
-        //    accesses made by different CUs. At the moment, that thing is the
-        //    same barrier that also determines which CU does the final reduction.
+        //    accesses made by different workgroups. At the moment, that thing is the
+        //    same barrier that also determines which workgroup does the final reduction.
         //    If we try to potentially save the global store here, we will need
         //    to add a second fence.
         // 2. Trying to keep this in registers would mean more register pressure
@@ -2381,16 +2380,16 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
 
         // Increment the atomic counter and agent-scope acquire-release fence.
         // This has the effect of ordering the above accumulator store before
-        // the below accumulator loads across CUs ("agent scope").
+        // the below accumulator loads across workgroups ("agent scope").
         int counter_value = workgroup_atomic_increment(atomic_counter);
 
-        // Determine if we are the CU that should perform the final reduction.
-        if (counter_value == cooperating_cu_count) {
+        // Determine if we are the workgroup that should perform the final reduction.
+        if (counter_value == cooperating_workgroup_count) {
           // Perform the final reduction.
           acc = final_reduction(M_outer, N_outer, K_outer,
             local_accumulators_buffer,
-            tile_idx, cooperating_cu_start,
-            cooperating_cu_end);
+            tile_idx, cooperating_workgroup_start,
+            cooperating_workgroup_end);
 
           // Reset the atomic counter to 0 so that the auxiliary buffer is ready to
           // reuse in another kernel launch.
@@ -2431,7 +2430,7 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
   }
 
   // Helper: inner MFMA loop. Similar to the MacLoop function given in
-  // Algorithm 4 in https://arxiv.org/pdf/2301.03598.
+  // Algorithm 3 in https://arxiv.org/pdf/2301.03598.
   __device__ static acc_array_t mac_loop(const void *A_data, const void *B_data, int K_outer, int m_outer,
                                   int n_outer, int k_iter_start,
                                   int k_iter_end) {
@@ -2507,8 +2506,8 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
   }
   // Helper: maybe perform the final reduction of partial accumulators to the
   // destination C-matrix. The condition depends on atomic counter increments
-  // telling us if we are the CU that is responsible for this among other CUs
-  // cooperating on a tile. It is thus non-deterministic which CU will perform
+  // telling us if we are the workgroup that is responsible for this among other workgroups
+  // cooperating on a tile. It is thus non-deterministic which workgroup will perform
   // this final reduction, but the final C-matrix elements must be
   // deterministic. This is achieved by deterministically looping over the
   // partial accumulators in order of increasing K-dimension indices, regardless
@@ -2517,16 +2516,16 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
   final_reduction(int M_outer, int N_outer,
                            int K_outer,
                            float *local_accumulators_buffer, int tile_idx,
-                           int cooperating_cu_start, int cooperating_cu_end) {
+                           int cooperating_workgroup_start, int cooperating_workgroup_end) {
     acc_array_t acc = {0};
     // Sum the partial accumulators in deterministic order of increasing
     // compute unit index, which makes to determinisic order of increasing K
     // dimension index.
-    for (int other_cu = cooperating_cu_start; other_cu < cooperating_cu_end;
-         ++other_cu) {
-      int other_cu_idx_in_cooperating_group = other_cu - cooperating_cu_start;
+    for (int other_workgroup = cooperating_workgroup_start; other_workgroup < cooperating_workgroup_end;
+         ++other_workgroup) {
+      int other_workgroup_idx_in_cooperating_group = other_workgroup - cooperating_workgroup_start;
       int other_local_accumulator_idx =
-          other_cu_idx_in_cooperating_group +
+          other_workgroup_idx_in_cooperating_group +
           tile_idx * local_accumulators_count_per_tile(
                          MNKShape{M_outer, N_outer, K_outer});
       floatx4_t *other_accum_ptr = reinterpret_cast<floatx4_t *>(

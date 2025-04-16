@@ -2285,7 +2285,7 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
   using float16x8_t =
       __attribute__((__vector_size__(8 * sizeof(_Float16)))) _Float16;
   static constexpr int num_acc_vec4s = MS * NS / 4;
-  using acc_array_t = std::array<floatx4_t, MS * NS / 4>;
+  using acc_array_t = std::array<floatx4_t, num_acc_vec4s>;
   // Device kernel implementation.
   __global__ __launch_bounds__(256) static void run(const void *A_data,
                                                     const void *B_data,
@@ -2328,7 +2328,7 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
       acc_array_t acc =  mac_loop(A_data, B_data, K_outer, m_outer, n_outer, local_iter,
         local_iter_end);
 
-      // Thext step is specific to our wait-free atomic approach: we need to
+      // The next step is specific to our wait-free atomic approach: we need to
       // know the interval of other compute units cooperating with the current
       // compute unit on the current tile.
       int cooperating_cu_start =

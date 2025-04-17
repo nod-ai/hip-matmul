@@ -15,7 +15,7 @@
 using matvec_func_t = void (*)(const void * /*A*/, const void * /*B*/,
                                void * /*C*/, int /*M*/, int /*N*/, int /*K*/);
 
-struct ProblemSize {
+struct ProblemProperties {
   Type A_type;
   Type B_type;
   Type C_type;
@@ -24,7 +24,7 @@ struct ProblemSize {
   MNKShape tile;
 };
 
-void print(const ProblemSize &problem, FILE *file = stderr) {
+void print(const ProblemProperties &problem, FILE *file = stderr) {
   fprintf(file, "A:%s, B:%s, C:%s, Total MxNxK=%dx%dx%d\n", str(problem.A_type),
           str(problem.B_type), str(problem.C_type), problem.total.M,
           problem.total.N, problem.total.K);
@@ -33,15 +33,15 @@ void print(const ProblemSize &problem, FILE *file = stderr) {
           problem.tile.N, problem.tile.K);
 }
 
-int flat_a_size(const ProblemSize &problem) {
+int flat_a_size(const ProblemProperties &problem) {
   return type_size(problem.A_type) * problem.total.M * problem.total.K;
 }
 
-int flat_b_size(const ProblemSize &problem) {
+int flat_b_size(const ProblemProperties &problem) {
   return type_size(problem.B_type) * problem.total.N * problem.total.K;
 }
 
-int flat_c_size(const ProblemSize &problem) {
+int flat_c_size(const ProblemProperties &problem) {
   return type_size(problem.C_type) * problem.total.M * problem.total.N;
 }
 
@@ -57,9 +57,9 @@ struct MatvecKernel {
   matvec_func_t matvec_func; // Device kernel pointer.
 };
 
-ProblemSize getBenchmarkProblemSize(const MatvecKernel &kernel,
+ProblemProperties getBenchmarkProblemSize(const MatvecKernel &kernel,
                                     MNKShape total) {
-  ProblemSize problem_size = {};
+  ProblemProperties problem_size = {};
   problem_size.A_type = kernel.A_type;
   problem_size.B_type = kernel.B_type;
   problem_size.C_type = kernel.C_type;
@@ -72,7 +72,7 @@ ProblemSize getBenchmarkProblemSize(const MatvecKernel &kernel,
   return problem_size;
 }
 
-ProblemSize getCheckProblemSize(const MatvecKernel &kernel) {
+ProblemProperties getCheckProblemSize(const MatvecKernel &kernel) {
   int M = getIntEnvVar("M", 4096);
   int N = getIntEnvVar("N", 1);
   int K = getIntEnvVar("K", 4096);
@@ -82,7 +82,7 @@ ProblemSize getCheckProblemSize(const MatvecKernel &kernel) {
 
 template <Type A_type, Type B_type, Type C_type>
 void checkMatvecResults(const void *A_data_void, const void *B_data_void,
-                        const void *C_data_void, const ProblemSize &problem) {
+                        const void *C_data_void, const ProblemProperties &problem) {
   if (getIntEnvVar("DEBUG", 0)) {
     fprintf(stderr, "Checking matvec result\n");
     print(problem);
@@ -130,7 +130,7 @@ void checkMatvecResults(const void *A_data_void, const void *B_data_void,
 
 void checkMatvecResults(Type A_type, Type B_type, Type C_type,
                         const void *A_data_void, const void *B_data_void,
-                        const void *C_data_void, const ProblemSize &problem) {
+                        const void *C_data_void, const ProblemProperties &problem) {
 #define HANDLE_CASE(A, B, C)                                                   \
   if (A_type == Type::A && B_type == Type::B && C_type == Type::C) {           \
     checkMatvecResults<Type::A, Type::B, Type::C>(A_data_void, B_data_void,    \
@@ -146,7 +146,7 @@ void checkMatvecResults(Type A_type, Type B_type, Type C_type,
   abort();
 }
 
-void check(const MatvecKernel &kernel, const ProblemSize &problem) {
+void check(const MatvecKernel &kernel, const ProblemProperties &problem) {
   std::minstd_rand random_engine;
   std::vector<std::byte> A_host_data =
       makeRandomBuffer(kernel.A_type, flat_a_size(problem), random_engine);
@@ -195,7 +195,7 @@ void check(const MatvecKernel &kernel) {
 }
 
 void benchmark(const MatvecKernel &kernel, MNKShape total) {
-  ProblemSize problem = getBenchmarkProblemSize(kernel, total);
+  ProblemProperties problem = getBenchmarkProblemSize(kernel, total);
   std::printf("  Benchmarking: ");
   print(problem, stdout);
 

@@ -4,7 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-#include <hip/hip_runtime.h>
+#include "common.hip"
 
 #include <cstdio>
 #include <cxxabi.h>
@@ -13,21 +13,8 @@
 #include <typeinfo>
 #include <vector>
 
-void hip_check_impl(hipError_t hip_error_code, const char *condstr,
-                    const char *file, int line) {
-  if (hip_error_code != hipSuccess) {
-    fprintf(stderr, "HIP Error \"%s\" produced by `%s` at %s:%d\n",
-            hipGetErrorString(hip_error_code), condstr, file, line);
-    exit(EXIT_FAILURE);
-  }
-}
-
-#define HIP_CHECK(expr) hip_check_impl(expr, #expr, __FILE__, __LINE__)
-
-int getIntEnvVar(const char *name, int default_val) {
-  const char *env = std::getenv(name);
-  return env ? std::stoi(env) : default_val;
-};
+typedef void (*mmt_func_t)(const void *, const void *, void *, void *, int, int,
+                           int);
 
 typedef int (*tile_layout_func_t)(int, int);
 
@@ -35,10 +22,6 @@ struct TiledMatrixShape {
   int rows_outer, cols_outer;
   int rows_tile, cols_tile;
   tile_layout_func_t tile_layout;
-};
-
-struct MNKShape {
-  int M, N, K;
 };
 
 struct TiledMmtShape {
@@ -67,152 +50,6 @@ __device__ __host__ int offset(const TiledMatrixShape &s, int r_outer,
   return s.tile_layout(r_tile, c_tile) +
          s.rows_tile * s.cols_tile * (c_outer + s.cols_outer * r_outer);
 }
-
-enum class Type { SI8, SI16, SI32, FP16, FP32 };
-
-const char *str(Type t) {
-  switch (t) {
-  case Type::SI8:
-    return "si8";
-  case Type::SI16:
-    return "si16";
-  case Type::SI32:
-    return "si32";
-  case Type::FP16:
-    return "fp16";
-  case Type::FP32:
-    return "fp32";
-  }
-}
-
-__device__ __host__ int type_size(Type t) {
-  switch (t) {
-  case Type::SI8:
-    return 1;
-  case Type::SI16:
-    return 2;
-  case Type::SI32:
-    return 4;
-  case Type::FP16:
-    return 2;
-  case Type::FP32:
-    return 4;
-  }
-}
-
-template <Type t> struct CTypeImpl {};
-template <> struct CTypeImpl<Type::SI8> {
-  using type = int8_t;
-};
-template <> struct CTypeImpl<Type::SI16> {
-  using type = int16_t;
-};
-template <> struct CTypeImpl<Type::SI32> {
-  using type = int32_t;
-};
-template <> struct CTypeImpl<Type::FP16> {
-  using type = _Float16;
-};
-template <> struct CTypeImpl<Type::FP32> {
-  using type = float;
-};
-template <Type t> using CType = typename CTypeImpl<t>::type;
-
-template <Type type>
-void fillRandomBuffer(int size, std::minstd_rand &r, void *out_buffer) {
-  using T = CType<type>;
-  T *out_buffer_typed = static_cast<T *>(out_buffer);
-  for (int i = 0; i < size; ++i) {
-    // Generate small integers in [-2, +2] so products are in [-4, +4] so
-    // accumulators are in [-4K, +4K] for accumulation depth K so they're
-    // exactly representable, float rounding is exact and we don't need
-    // fuzzy compares.
-    out_buffer_typed[i] = static_cast<T>(static_cast<int>((r() % 5)) - 2);
-  }
-}
-
-std::vector<std::byte> makeRandomBuffer(Type type, int size,
-                                        std::minstd_rand &r) {
-  int bytes = size * type_size(type);
-  std::vector<std::byte> result(bytes);
-  if (type == Type::SI8) {
-    fillRandomBuffer<Type::SI8>(size, r, result.data());
-  } else if (type == Type::SI16) {
-    fillRandomBuffer<Type::SI16>(size, r, result.data());
-  } else if (type == Type::SI32) {
-    fillRandomBuffer<Type::SI32>(size, r, result.data());
-  } else if (type == Type::FP16) {
-    fillRandomBuffer<Type::FP16>(size, r, result.data());
-  } else if (type == Type::FP32) {
-    fillRandomBuffer<Type::FP32>(size, r, result.data());
-  }
-  return result;
-}
-
-template <Type A_type, Type B_type, Type C_type>
-void checkMmtResults(const void *A_data_void, const void *B_data_void,
-                     const void *C_data_void, const TiledMmtShape &s) {
-  using TA = CType<A_type>;
-  using TB = CType<B_type>;
-  using TC = CType<C_type>;
-  const TA *A_data = static_cast<const TA *>(A_data_void);
-  const TB *B_data = static_cast<const TB *>(B_data_void);
-  const TC *C_data = static_cast<const TC *>(C_data_void);
-  // This reference code is slow. To make the checks not too slow on
-  // large matmuls, we only check the 4 corner tiles.
-  for (int m_outer : {0, s.outer.M - 1}) {
-    for (int n_outer : {0, s.outer.N - 1}) {
-      for (int m_tile = 0; m_tile < s.tile.M; ++m_tile) {
-        for (int n_tile = 0; n_tile < s.tile.N; ++n_tile) {
-          float c = 0.f;
-          for (int k_outer = 0; k_outer < s.outer.K; ++k_outer) {
-            for (int k_tile = 0; k_tile < s.tile.K; ++k_tile) {
-              TA a =
-                  A_data[offset(A_shape(s), m_outer, k_outer, m_tile, k_tile)];
-              TB b =
-                  B_data[offset(B_shape(s), n_outer, k_outer, n_tile, k_tile)];
-              c += static_cast<TC>(a) * static_cast<TC>(b);
-            }
-          }
-          TC expected = c;
-          TC actual =
-              C_data[offset(C_shape(s), m_outer, n_outer, m_tile, n_tile)];
-          if (actual != expected) {
-            fprintf(stderr,
-                    "matmul numerical error: actual(%g) != "
-                    "expected(%g), at m_outer=%d n_outer=%d m_tile=%d "
-                    "n_tile=%d, at %s:%d. Note: outer MxNxK = %dx%dx%d\n",
-                    static_cast<float>(actual), static_cast<float>(expected),
-                    m_outer, n_outer, m_tile, n_tile, __FILE__, __LINE__,
-                    s.outer.M, s.outer.N, s.outer.K);
-            abort();
-          }
-        }
-      }
-    }
-  }
-}
-
-void checkMmtResults(Type A_type, Type B_type, Type C_type,
-                     const void *A_data_void, const void *B_data_void,
-                     const void *C_data_void, const TiledMmtShape &s) {
-#define HANDLE_CASE(A, B, C)                                                   \
-  if (A_type == Type::A && B_type == Type::B && C_type == Type::C) {           \
-    checkMmtResults<Type::A, Type::B, Type::C>(A_data_void, B_data_void,       \
-                                               C_data_void, s);                \
-    return;                                                                    \
-  }
-  HANDLE_CASE(FP32, FP32, FP32)
-  HANDLE_CASE(FP16, FP16, FP32)
-  HANDLE_CASE(SI8, SI8, SI32)
-#undef HANDLE_CASE
-
-  fprintf(stderr, "%s:%d: unhandled types\n", __FILE__, __LINE__);
-  abort();
-}
-
-typedef void (*mmt_func_t)(const void *, const void *, void *, void *, int, int,
-                           int);
 
 // Base class for matrix-times-matrix-transposed ("mmt") kernels.
 // As the RHS is transposed, the dimensions are:
@@ -283,6 +120,68 @@ TiledMmtShape getTestShape(const MmtKernel &kernel, const MNKShape &o) {
 dim3 getLaunchGrid(const MmtKernel &kernel, const TiledMmtShape &s) {
   return kernel.get_work_centric_grid(s.outer).value_or(
       dim3(s.outer.M, s.outer.N));
+}
+
+template <Type A_type, Type B_type, Type C_type>
+void checkMmtResults(const void *A_data_void, const void *B_data_void,
+                     const void *C_data_void, const TiledMmtShape &s) {
+  using TA = CType<A_type>;
+  using TB = CType<B_type>;
+  using TC = CType<C_type>;
+  const TA *A_data = static_cast<const TA *>(A_data_void);
+  const TB *B_data = static_cast<const TB *>(B_data_void);
+  const TC *C_data = static_cast<const TC *>(C_data_void);
+  // This reference code is slow. To make the checks not too slow on
+  // large matmuls, we only check the 4 corner tiles.
+  for (int m_outer : {0, s.outer.M - 1}) {
+    for (int n_outer : {0, s.outer.N - 1}) {
+      for (int m_tile = 0; m_tile < s.tile.M; ++m_tile) {
+        for (int n_tile = 0; n_tile < s.tile.N; ++n_tile) {
+          float c = 0.f;
+          for (int k_outer = 0; k_outer < s.outer.K; ++k_outer) {
+            for (int k_tile = 0; k_tile < s.tile.K; ++k_tile) {
+              TA a =
+                  A_data[offset(A_shape(s), m_outer, k_outer, m_tile, k_tile)];
+              TB b =
+                  B_data[offset(B_shape(s), n_outer, k_outer, n_tile, k_tile)];
+              c += static_cast<TC>(a) * static_cast<TC>(b);
+            }
+          }
+          TC expected = c;
+          TC actual =
+              C_data[offset(C_shape(s), m_outer, n_outer, m_tile, n_tile)];
+          if (actual != expected) {
+            fprintf(stderr,
+                    "matmul numerical error: actual(%g) != "
+                    "expected(%g), at m_outer=%d n_outer=%d m_tile=%d "
+                    "n_tile=%d, at %s:%d. Note: outer MxNxK = %dx%dx%d\n",
+                    static_cast<float>(actual), static_cast<float>(expected),
+                    m_outer, n_outer, m_tile, n_tile, __FILE__, __LINE__,
+                    s.outer.M, s.outer.N, s.outer.K);
+            abort();
+          }
+        }
+      }
+    }
+  }
+}
+
+void checkMmtResults(Type A_type, Type B_type, Type C_type,
+                     const void *A_data_void, const void *B_data_void,
+                     const void *C_data_void, const TiledMmtShape &s) {
+#define HANDLE_CASE(A, B, C)                                                   \
+  if (A_type == Type::A && B_type == Type::B && C_type == Type::C) {           \
+    checkMmtResults<Type::A, Type::B, Type::C>(A_data_void, B_data_void,       \
+                                               C_data_void, s);                \
+    return;                                                                    \
+  }
+  HANDLE_CASE(FP32, FP32, FP32)
+  HANDLE_CASE(FP16, FP16, FP32)
+  HANDLE_CASE(SI8, SI8, SI32)
+#undef HANDLE_CASE
+
+  fprintf(stderr, "%s:%d: unhandled types\n", __FILE__, __LINE__);
+  abort();
 }
 
 void check(const MmtKernel &kernel, const MNKShape &o) {
@@ -2144,16 +2043,6 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
     }
   }
 };
-
-template <typename A, typename B>
-__device__ __host__ std::common_type_t<A, B> ceil_div(A a, B b) {
-  return (a + b - 1) / b;
-}
-
-template <int Po2, typename A> __device__ __host__ A round_up_to_po2(A a) {
-  static_assert(Po2 > 0 && (Po2 & (Po2 - 1)) == 0);
-  return ((a - 1) | (Po2 - 1)) + 1;
-}
 
 // A simple Stream-K kernel variant of
 // MmtKernel_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2.

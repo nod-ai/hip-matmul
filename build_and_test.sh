@@ -1,14 +1,17 @@
 #!/bin/bash
 
-set -eux
+set -euxo pipefail
 
 if [[ ! -d build ]]
 then
   mkdir build
 fi
 
-executable=build/hip-matmul
+readonly KERNELS_TO_RUN="${KERNELS_TO_RUN:-matmul matvec}"
 
-hipcc matmul.hip -std=c++20 -Wall -Wextra -O3 -o "${executable}" -save-temps=obj
-
-"${executable}"
+for kernel in $KERNELS_TO_RUN; do
+  echo "Build and test: ${kernel}"
+  executable="build/hip-${kernel}"
+  hipcc "${kernel}.hip" -std=c++20 -Wall -Wextra -O3 -o "${executable}" -save-temps=obj
+  "${executable}"
+done

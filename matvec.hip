@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <random>
+#include <type_traits>
 #include <vector>
 
 // Device function that implements a matrix vector multiplication over data in
@@ -329,6 +330,14 @@ struct NaiveMatmulKernel : MatvecKernel {
   }
 };
 
+template <typename T> static T fma(T a, T b, T c) {
+  if constexpr (std::is_integral_v<T>) {
+    return a * b + c;
+  } else {
+    return std::fma(a, b, c);
+  }
+}
+
 template <int T_M_tile, int T_K_tile>
 struct SubgroupReduceKernel : MatvecKernel {
   using TA = float;
@@ -393,8 +402,8 @@ struct SubgroupReduceKernel : MatvecKernel {
       // Partial reduciton. Ideally, we'd like this to generate FMAs.
       for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
         for (int k = 0; k < K_VEC; ++k) {
-          c[m_tile][k] +=
-              static_cast<TC>(a[m_tile][k]) * static_cast<TC>(b[0][k]);
+          c[m_tile][k] = fma(static_cast<TC>(a[m_tile][k]),
+                             static_cast<TC>(b[0][k]), c[m_tile][k]);
         }
       }
     }

@@ -329,6 +329,101 @@ struct NaiveMatmulKernel : MatvecKernel {
   }
 };
 
+template <int T_M_tile, int T_K_tile>
+struct SubgroupReduceKernel : MatvecKernel {
+  using TA = float;
+  using TB = float;
+  using TC = float;
+  static constexpr int T_N_tile = 1;
+
+  // In this matvec kernel, the whole subgroup processes a row and cooperatively
+  // reduces the result using subgroup operations. At the end, only one thread
+  // within the subgroups stores the row value to the main memory.
+  SubgroupReduceKernel() {
+    name = __FUNCTION__;
+    A_type = Type::FP32;
+    B_type = Type::FP32;
+    C_type = Type::FP32;
+    M_tile = T_M_tile;
+    N_tile = T_N_tile;
+    K_tile = T_K_tile;
+    num_threads = warpSize;
+    matvec_func = run;
+  }
+
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int M, int N, int K) {
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int lane = threadIdx.x % warpSize;
+
+    // The number of adjacent elements to be accessed by a thread. This is used
+    // to guarantee vectorized memory accesses, e.g., `global_load_dwordx4`.
+    static constexpr int K_VEC = T_K_tile / warpSize;
+    int K_outer = ceil_div(K, T_K_tile);
+
+    int global_m = m_outer * T_M_tile;
+    int global_n = n_outer * T_N_tile;
+    if (global_m >= M || global_n >= N)
+      return;
+
+    int tile_k = lane * K_VEC;
+    // Partial accumulator for the thread,
+    // storing `K_VEC` values per row.
+    TC c[T_M_tile][K_VEC] = {{0}};
+
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      // Load the vector operand first to hide the latency. We will need these
+      // values for every row slice of the matrix operand.
+      TA b[T_N_tile][K_VEC] = {{0}};
+      for (int k = 0; k < K_VEC; ++k) {
+        int global_k = k_outer * T_K_tile + tile_k + k;
+        b[0][k] = static_cast<const TB *>(B_data)[global_n * K + global_k];
+      }
+
+      TA a[T_M_tile][K_VEC] = {{0}};
+      for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
+        for (int k = 0; k < K_VEC; ++k) {
+          int global_k = k_outer * T_K_tile + tile_k + k;
+          a[m_tile][k] = static_cast<const TA *>(
+              A_data)[(global_m + m_tile) * K + global_k];
+        }
+      }
+
+      // Partial reduciton. Ideally, we'd like this to generate FMAs.
+      for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
+        for (int k = 0; k < K_VEC; ++k) {
+          c[m_tile][k] +=
+              static_cast<TC>(a[m_tile][k]) * static_cast<TC>(b[0][k]);
+        }
+      }
+    }
+
+    // Perform thread-level reduction first, producing a single partial result
+    // per thread.
+    TC res[T_M_tile] = {{0}};
+    for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
+      for (int k = 0; k < K_VEC; ++k) {
+        res[m_tile] += c[m_tile][k];
+      }
+    }
+
+    // Perform subgroup-level reduction, such that thread 0 contains the final
+    // result for the whole subgroup.
+    for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
+      for (int offset = warpSize >> 1; offset > 0; offset = offset >> 1) {
+        res[m_tile] += __shfl_down(res[m_tile], offset, warpSize);
+      }
+    }
+    if (lane == 0) {
+      for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
+        static_cast<TC *>(C_data)[(global_m + m_tile) * N + global_n] =
+            res[m_tile];
+      }
+    }
+  }
+};
+
 void test(const MatvecKernel &kernel) {
   const char *filter = getenv("FILTER");
   if (filter && !strstr(kernel.name, filter)) {
@@ -350,4 +445,11 @@ void test(const MatvecKernel &kernel) {
   }
 }
 
-int main() { test(NaiveMatmulKernel{}); }
+int main() {
+  test(NaiveMatmulKernel{});
+  test(SubgroupReduceKernel<1, warpSize>{});
+  test(SubgroupReduceKernel<1, warpSize * 4>{});
+  test(SubgroupReduceKernel<4, warpSize>{});
+  test(SubgroupReduceKernel<4, warpSize * 4>{});
+  return 0;
+}

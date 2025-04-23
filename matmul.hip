@@ -2949,7 +2949,7 @@ class MmtKernel_256t_MSxNS_amdgcn_mfma_i32_16x16x32i8_shared_Kx2_pipeline_v3
       }
     };
 
-    auto sync = [] { __builtin_amdgcn_s_barrier(); };
+    auto sync = [] { __syncthreads(); };
 
     global_to_vgpr0();
     vpgr0_to_shared();

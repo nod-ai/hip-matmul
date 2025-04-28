@@ -6,6 +6,7 @@
 
 #include "common.hip"
 
+#include <cassert>
 #include <cstdio>
 #include <random>
 #include <type_traits>
@@ -24,6 +25,11 @@ struct ProblemProperties {
   MNKShape outer;
   MNKShape tile;
 };
+
+using num_threads_func_t = int (*)(const ProblemProperties & /*problem*/);
+using shared_mem_bytes_func_t = size_t (*)(const ProblemProperties & /*problem*/);
+
+size_t no_shared_mem(const ProblemProperties &) { return 0; }
 
 void print(const ProblemProperties &problem, FILE *file = stderr) {
   fprintf(file, "A:%s, B:%s, C:%s, Total MxNxK=%dx%dx%d\n", str(problem.A_type),
@@ -54,7 +60,10 @@ struct MatvecKernel {
   int M_tile;       // M-dimension tile size (rows of accumulator).
   int N_tile;       // N-dimension tile size (columns of accumulator).
   int K_tile;       // K-dimension tile size (reduction dimension).
-  int num_threads;  // Number of threads that the kernel requires running on.
+  num_threads_func_t num_threads_func; // Number of threads that the kernel
+                                       // requires running on.
+  shared_mem_bytes_func_t
+      shared_mem_bytes_func;      // Amount of shared memory per workgroup.
   matvec_func_t matvec_func; // Device kernel pointer.
 };
 
@@ -174,11 +183,16 @@ void check(const MatvecKernel &kernel, const ProblemProperties &problem) {
   HIP_CHECK(hipGetLastError());
 
   const dim3 grid_dim(problem.outer.M, problem.outer.N);
-  const dim3 block_dim(kernel.num_threads);
+  const dim3 block_dim(kernel.num_threads_func(problem));
+  const size_t shared_mem_bytes = kernel.shared_mem_bytes_func(problem);
+  fprintf(stderr, "Num threads: %d\n", block_dim.x);
+  fprintf(stderr, "Shared mem bytes: %zu\n", shared_mem_bytes);
+
   HIP_CHECK(hipGetLastError());
-  kernel.matvec_func<<<grid_dim, block_dim, 0, hipStreamDefault>>>(
-      A_device_buffer, B_device_buffer, C_device_buffer, problem.total.M,
-      problem.total.N, problem.total.K);
+  kernel
+      .matvec_func<<<grid_dim, block_dim, shared_mem_bytes, hipStreamDefault>>>(
+          A_device_buffer, B_device_buffer, C_device_buffer, problem.total.M,
+          problem.total.N, problem.total.K);
   HIP_CHECK(hipGetLastError());
   HIP_CHECK(hipMemcpy(C_host_data.data(), C_device_buffer, C_host_data.size(),
                       hipMemcpyDeviceToHost));
@@ -223,7 +237,8 @@ void benchmark(const MatvecKernel &kernel, MNKShape total) {
                       hipMemcpyHostToDevice));
 
   const dim3 grid_dim(problem.outer.M, problem.outer.N);
-  const dim3 block_dim(kernel.num_threads);
+  const dim3 block_dim(kernel.num_threads_func(problem));
+  const size_t shared_mem_bytes = kernel.shared_mem_bytes_func(problem);
 
   hipEvent_t start, stop;
   HIP_CHECK(hipEventCreate(&start));
@@ -235,7 +250,8 @@ void benchmark(const MatvecKernel &kernel, MNKShape total) {
   while (true) {
     HIP_CHECK(hipEventRecord(start, hipStreamDefault));
     for (int b = 0; b < iterations; ++b) {
-      kernel.matvec_func<<<grid_dim, block_dim, 0, hipStreamDefault>>>(
+      kernel.matvec_func<<<grid_dim, block_dim, shared_mem_bytes,
+                           hipStreamDefault>>>(
           A_device_buffer, B_device_buffer, C_device_buffer, problem.total.M,
           problem.total.N, problem.total.K);
     }
@@ -294,7 +310,10 @@ struct NaiveMatmulKernel : MatvecKernel {
     M_tile = T_M_tile;
     N_tile = T_N_tile;
     K_tile = T_K_tile;
-    num_threads = M_tile * N_tile;
+    num_threads_func = [](const ProblemProperties &) {
+      return T_M_tile * T_N_tile;
+    };
+    shared_mem_bytes_func = no_shared_mem;
     matvec_func = run;
   }
 
@@ -330,13 +349,20 @@ struct NaiveMatmulKernel : MatvecKernel {
   }
 };
 
-template <typename T> static T fma(T a, T b, T c) {
+template <typename T> __device__ static T fma(T a, T b, T c) {
   if constexpr (std::is_integral_v<T>) {
     return a * b + c;
   } else {
     return std::fma(a, b, c);
   }
 }
+
+template <typename T> __device__ static T subgroup_reduce(T value) {
+  for (int offset = warpSize >> 1; offset > 0; offset = offset >> 1) {
+    value += __shfl_down(value, offset, warpSize);
+  }
+  return value;
+};
 
 template <int T_M_tile, int T_K_tile>
 struct SubgroupReduceKernel : MatvecKernel {
@@ -356,7 +382,8 @@ struct SubgroupReduceKernel : MatvecKernel {
     M_tile = T_M_tile;
     N_tile = T_N_tile;
     K_tile = T_K_tile;
-    num_threads = warpSize;
+    num_threads_func = [](const ProblemProperties &) { return warpSize; };
+    shared_mem_bytes_func = no_shared_mem;
     matvec_func = run;
   }
 
@@ -420,9 +447,7 @@ struct SubgroupReduceKernel : MatvecKernel {
     // Perform subgroup-level reduction, such that thread 0 contains the final
     // result for the whole subgroup.
     for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
-      for (int offset = warpSize >> 1; offset > 0; offset = offset >> 1) {
-        res[m_tile] += __shfl_down(res[m_tile], offset, warpSize);
-      }
+      res[m_tile] = subgroup_reduce(res[m_tile]);
     }
     if (lane == 0) {
       for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
@@ -433,15 +458,143 @@ struct SubgroupReduceKernel : MatvecKernel {
   }
 };
 
+template <int T_M_tile, int T_K_tile>
+struct WorkgroupReduceKernel : MatvecKernel {
+  using TA = float;
+  using TB = float;
+  using TC = float;
+  static constexpr int T_N_tile = 1;
+  static constexpr int K_VEC =
+      std::min(T_K_tile, 16 / static_cast<int>(sizeof(TA)));
+  static constexpr int K_outer = T_K_tile / K_VEC;
+  static_assert(T_K_tile == K_VEC * K_outer, "Invalid configuration");
+
+  // In this matvec kernel, the whole workgroups processes a row and cooperatively
+  // reduces the result using subgroup operations. At the end, only one thread
+  // within the subgroups stores the row value to the main memory.
+  WorkgroupReduceKernel() {
+    name = __FUNCTION__;
+    A_type = Type::FP32;
+    B_type = Type::FP32;
+    C_type = Type::FP32;
+    M_tile = T_M_tile;
+    N_tile = T_N_tile;
+    K_tile = T_K_tile;
+    num_threads_func = [](const ProblemProperties &problem) {
+      assert(problem.total.K % T_K_tile == 0 && "Unsupported input");
+      return problem.total.K / T_K_tile;
+    };
+    shared_mem_bytes_func = [](const ProblemProperties &problem) {
+      int num_subgroups = ceil_div(problem.total.K / T_K_tile, warpSize);
+      assert(num_subgroups <= 32 && "Too many subgroups per workgroup");
+      return sizeof(TC) * T_M_tile * num_subgroups;
+    };
+    matvec_func = run;
+  }
+
+  __global__ static void run(const void *A_data, const void *B_data,
+                             void *C_data, int M, int N, int K) {
+    extern __shared__ TC shared_mem[];
+
+    const int num_subgroups = ceil_div(K / T_K_tile, warpSize);
+    int m_outer = blockIdx.x;
+    int n_outer = blockIdx.y;
+    int lane = threadIdx.x % warpSize;
+    int subgroup = threadIdx.x / warpSize;
+
+    int global_m = m_outer * T_M_tile;
+    int global_n = n_outer * T_N_tile;
+    if (global_m >= M || global_n >= N)
+      return;
+
+    static constexpr int K_per_subgroup = T_K_tile * warpSize;
+    static constexpr int K_per_outer = K_VEC * warpSize;
+    int tile_k = subgroup * K_per_subgroup + lane * K_VEC;
+
+    // Load the vector operand first to hide the latency. We will need these
+    // values for every row slice of the matrix operand.
+    TA b[T_N_tile][K_outer][K_VEC] = {{{0}}};
+    for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+      for (int k = 0; k < K_VEC; ++k) {
+        int global_k = tile_k + k_outer * K_per_outer + k;
+        b[0][k_outer][k] =
+            static_cast<const TB *>(B_data)[global_n * K + global_k];
+      }
+    }
+
+    TA a[T_M_tile][K_outer][K_VEC] = {{{0}}};
+    for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
+      for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+        for (int k = 0; k < K_VEC; ++k) {
+          int global_k = tile_k + k_outer * K_per_outer + k;
+          a[m_tile][k_outer][k] = static_cast<const TA *>(
+              A_data)[(global_m + m_tile) * K + global_k];
+        }
+      }
+    }
+
+    // Partial accumulator for the thread, storing `T_K_tile` values per row.
+    TC c[T_M_tile][K_outer][K_VEC] = {{{0}}};
+    for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
+      for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+        for (int k = 0; k < K_VEC; ++k) {
+          c[m_tile][k_outer][k] =
+              fma(static_cast<TC>(a[m_tile][k_outer][k]),
+                  static_cast<TC>(b[0][k_outer][k]), c[m_tile][k_outer][k]);
+        }
+      }
+    }
+
+    // Perform thread-level reduction first, producing a single partial
+    // result per thread.
+    TC res[T_M_tile] = {0};
+    for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
+      for (int k_outer = 0; k_outer < K_outer; ++k_outer) {
+        for (int k = 0; k < K_VEC; ++k) {
+          res[m_tile] += c[m_tile][k_outer][k];
+        }
+      }
+    }
+
+    // Perform subgroup-level reduction, such that thread 0 contains the
+    // final result for the whole subgroup.
+    for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
+      TC thread_res = subgroup_reduce(res[m_tile]);
+      res[m_tile] = thread_res;
+    }
+
+    // Store the subgroup results in shared memory.
+    if (lane == 0) {
+      for (int m_tile = 0; m_tile < T_M_tile; ++m_tile) {
+        shared_mem[subgroup * T_M_tile + m_tile] = res[m_tile];
+      }
+    }
+
+    __syncthreads();
+
+    // Each subgroup will reduce one or more rows.
+    for (int m_tile = subgroup; m_tile < T_M_tile; m_tile += num_subgroups) {
+      TC thread_res = -TC{0};
+      if (lane < num_subgroups) {
+        thread_res = shared_mem[lane * T_M_tile + m_tile];
+      }
+
+      TC final = subgroup_reduce(thread_res);
+      if (lane == 0) {
+        static_cast<TC *>(C_data)[(global_m + m_tile) * N + global_n] = final;
+      }
+    }
+  }
+};
+
 void test(const MatvecKernel &kernel) {
   const char *filter = getenv("FILTER");
   if (filter && !strstr(kernel.name, filter)) {
     return;
   }
-  std::printf("%s: A:%s, B:%s, C:%s, tile MxNxK=%dx%dx%d, num_threads=%d\n",
-              kernel.name, str(kernel.A_type), str(kernel.B_type),
-              str(kernel.C_type), kernel.M_tile, kernel.N_tile, kernel.K_tile,
-              kernel.num_threads);
+  std::printf("%s: A:%s, B:%s, C:%s, tile MxNxK=%dx%dx%d\n", kernel.name,
+              str(kernel.A_type), str(kernel.B_type), str(kernel.C_type),
+              kernel.M_tile, kernel.N_tile, kernel.K_tile);
 
   if (!getenv("SKIP_CHECK")) {
     check(kernel);
@@ -460,5 +613,9 @@ int main() {
   test(SubgroupReduceKernel<1, warpSize * 4>{});
   test(SubgroupReduceKernel<4, warpSize>{});
   test(SubgroupReduceKernel<4, warpSize * 4>{});
+  test(WorkgroupReduceKernel<1, 4 * 4>{});
+  test(WorkgroupReduceKernel<2, 4 * 4>{});
+  test(WorkgroupReduceKernel<3, 4 * 4>{});
+  test(WorkgroupReduceKernel<4, 4 * 4>{});
   return 0;
 }

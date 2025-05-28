@@ -2666,10 +2666,6 @@ class MmtKernel_StreamKTree_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
               atomic_counter_base + 2 * parent_idx + nudge;
           // Perform the atomic operation to indicate that we have written our
           // partial accumulator.
-          //
-          // FIXME(bjacob): either reset atomic values at the end or make it
-          // clear in the contract that this kernel leaves mutated contents in
-          // the user-provided auxiliary buffer.
           uint32_t counter_value = workgroup_atomic_or(atomic_counter, bit);
           // Test if the sibling workgroup had written their partial accumulator
           if (!(counter_value & bit)) {
@@ -2691,6 +2687,11 @@ class MmtKernel_StreamKTree_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
         // Note: consumer fusions go here.
         acc_store(acc, static_cast<floatx4_t *>(C_data) +
                            MS * NS * 16 * 4 * (N_outer * m_outer + n_outer));
+
+        // Reset atomic counters for the next kernel launch.
+        atomic_t *atomic_counter_base = reinterpret_cast<atomic_t *>(
+            aux_bytes + cooperating_workgroup_start * 2 * sizeof(atomic_t));
+        for (int i = 0; i < cooperating_workgroup_count; ++i) atomic_counter_base[2 * i + (tile_idx & 1)] = 0;
       }
 
       iter = tile_iter_end;

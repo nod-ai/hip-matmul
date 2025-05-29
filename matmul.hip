@@ -2200,7 +2200,7 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
     int total_iters = total_tiles * iters_per_tile;
     int workgroup_count = get_workgroup_count(outer);
     int workgroup = blockIdx.x;
-    const int NUM_XCDS = 38;
+    const int NUM_XCDS = 8;
     if (workgroup_count == MaxWorkgroups) {
       workgroup = (workgroup % NUM_XCDS) * (workgroup_count / NUM_XCDS) + (workgroup / NUM_XCDS);
     }
@@ -2577,7 +2577,7 @@ class MmtKernel_StreamKTree_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
     int total_iters = total_tiles * iters_per_tile;
     int workgroup_count = get_workgroup_count(outer);
     int workgroup = blockIdx.x;
-    const int NUM_XCDS = 38;
+    const int NUM_XCDS = 8;
     if (workgroup_count == MaxWorkgroups) {
       workgroup = (workgroup % NUM_XCDS) * (workgroup_count / NUM_XCDS) + (workgroup / NUM_XCDS);
     }

@@ -2202,7 +2202,8 @@ class MmtKernel_StreamK_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
     int workgroup = blockIdx.x;
     const int NUM_XCDS = 8;
     if (workgroup_count == MaxWorkgroups) {
-      workgroup = (workgroup % NUM_XCDS) * (workgroup_count / NUM_XCDS) + (workgroup / NUM_XCDS);
+      workgroup = (workgroup % NUM_XCDS) * (workgroup_count / NUM_XCDS) +
+                  (workgroup / NUM_XCDS);
     }
     int iter_start = workgroup * total_iters / workgroup_count;
     int iter_end = (workgroup + 1) * total_iters / workgroup_count;
@@ -2579,7 +2580,8 @@ class MmtKernel_StreamKTree_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
     int workgroup = blockIdx.x;
     const int NUM_XCDS = 8;
     if (workgroup_count == MaxWorkgroups) {
-      workgroup = (workgroup % NUM_XCDS) * (workgroup_count / NUM_XCDS) + (workgroup / NUM_XCDS);
+      workgroup = (workgroup % NUM_XCDS) * (workgroup_count / NUM_XCDS) +
+                  (workgroup / NUM_XCDS);
     }
     int iter_start = workgroup * total_iters / workgroup_count;
     int iter_end = (workgroup + 1) * total_iters / workgroup_count;
@@ -2699,10 +2701,361 @@ class MmtKernel_StreamKTree_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
         // Reset atomic counters for the next kernel launch.
         atomic_t *atomic_counter_base = reinterpret_cast<atomic_t *>(
             aux_bytes + cooperating_workgroup_start * 2 * sizeof(atomic_t));
-        for (int i = 0; i < cooperating_workgroup_count; ++i) atomic_counter_base[2 * i + (tile_idx & 1)] = 0;
+        for (int i = 0; i < cooperating_workgroup_count; ++i)
+          atomic_counter_base[2 * i + (tile_idx & 1)] = 0;
       }
 
       iter = tile_iter_end;
+    }
+  }
+  // Helper to store accumulators to memory.
+  __device__ static void acc_store(acc_array_t acc, floatx4_t *ptr) {
+    for (int i = 0; i < num_acc_vec4s; ++i) {
+      ptr[256 * i + threadIdx.x] = acc[i];
+    }
+  }
+
+  // Helper: inner MFMA loop. Similar to the MacLoop function given in
+  // Algorithm 3 in https://arxiv.org/pdf/2301.03598.
+  __device__ static acc_array_t mac_loop(const void *A_data, const void *B_data,
+                                         int K_outer, int m_outer, int n_outer,
+                                         int k_iter_start, int k_iter_end) {
+    // Accumulator VGPRs.
+    acc_array_t acc = {{0}};
+    int tid = threadIdx.x;
+    constexpr int A_tile_size_in_vec8 = MS * 16 * 4;
+    constexpr int B_tile_size_in_vec8 = NS * 16 * 4;
+    const float16x8_t *A_global =
+        static_cast<const float16x8_t *>(A_data) +
+        (m_outer * K_outer + k_iter_start) * A_tile_size_in_vec8;
+    const float16x8_t *B_global =
+        static_cast<const float16x8_t *>(B_data) +
+        (n_outer * K_outer + k_iter_start) * B_tile_size_in_vec8;
+    const float16x8_t *A_global_ptr = A_global + tid;
+    const float16x8_t *B_global_ptr = B_global + tid;
+
+    // Shared memory buffers for tiles of A and B matrices.
+    __shared__ float16x8_t A_shared[A_tile_size_in_vec8];
+    __shared__ float16x8_t B_shared[B_tile_size_in_vec8];
+
+    // Inner loop on K dimenion.
+    for (int k_iter = k_iter_start; k_iter < k_iter_end; ++k_iter) {
+      // Load data from global to shared memory.
+      for (int i = 0; i < A_tile_size_in_vec8; i += 256) {
+        A_shared[i + tid] = A_global_ptr[i];
+      }
+      for (int j = 0; j < B_tile_size_in_vec8; j += 256) {
+        B_shared[j + tid] = B_global_ptr[j];
+      }
+      A_global_ptr += A_tile_size_in_vec8;
+      B_global_ptr += B_tile_size_in_vec8;
+      __syncthreads();
+      // Perform MFMA arithmetic on data in shared memory.
+      for (int i = 0; i < MS; ++i) {
+        for (int j = 0; j < NS / 4; ++j) {
+          float16x8_t a = A_shared[64 * i + (tid % 64)];
+          float16x8_t b = B_shared[256 * j + tid];
+          float16x4_t a0 = (float16x4_t){a[0], a[1], a[2], a[3]};
+          float16x4_t a1 = (float16x4_t){a[4], a[5], a[6], a[7]};
+          float16x4_t b0 = (float16x4_t){b[0], b[1], b[2], b[3]};
+          float16x4_t b1 = (float16x4_t){b[4], b[5], b[6], b[7]};
+          floatx4_t acc0 = acc[i * (NS / 4) + j];
+          acc0 = __builtin_amdgcn_mfma_f32_16x16x16f16(a0, b0, acc0, 0, 0, 0);
+          acc0 = __builtin_amdgcn_mfma_f32_16x16x16f16(a1, b1, acc0, 0, 0, 0);
+          acc[i * (NS / 4) + j] = acc0;
+        }
+      }
+      __syncthreads();
+    }
+    return acc;
+  }
+  __device__ static uint32_t workgroup_atomic_or(atomic_t *atomic,
+                                                 uint32_t value) {
+    __shared__ int workgroup_value;
+    int tid = threadIdx.x;
+    if (tid == 0) {
+      // Thread0 fetches and increments the device-wide atomic.
+      // This is a relaxed atomic, which is fine, as we provide the memory
+      // ordering separately below with __builtin_amdgcn_fence, which usefully
+      // allows us to specify the memory scope.
+      int thread0_value = atomicOr(atomic, value);
+      // Thread0 stores the value to the workgroup-wide shared location.
+      workgroup_value = thread0_value;
+      // Memory scope is "agent" because we need other workgroups to see this.
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+    }
+    // Now all threads in the workgroup load the workgroup-wide shared value.
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    return workgroup_value;
+  }
+};
+
+template <int MS, int NS>
+class
+    MmtKernel_HybridStreamKTree_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
+    : public MmtKernel {
+  static_assert(MS >= 4 && !(MS % 4));
+  static_assert(NS >= 4 && !(NS % 4));
+  // Defining some values as constants as they will be needed in static methods
+  // below.
+  static constexpr Type static_A_type = Type::FP16;
+  static constexpr Type static_B_type = Type::FP16;
+  static constexpr Type static_C_type = Type::FP32;
+  static constexpr int static_M_tile = MS * 16;
+  static constexpr int static_N_tile = NS * 16;
+  static constexpr int static_K_tile = 32;
+  // Standard MmtKernel interface methods override describing element types.
+  virtual Type A_type() const override { return static_A_type; }
+  virtual Type B_type() const override { return static_B_type; }
+  virtual Type C_type() const override { return static_C_type; }
+  // Standard MmtKernel interface methods override describing tile shapes.
+  virtual int M_tile() const override { return static_M_tile; }
+  virtual int N_tile() const override { return static_N_tile; }
+  virtual int K_tile() const override { return static_K_tile; }
+  // Standard MmtKernel interface methods override describing tile layouts.
+  virtual tile_layout_func_t A_tile_layout() const override {
+    return [](int m, int k) {
+      int mi = m % 16;
+      int mo = m / 16;
+      return 512 * mo + 128 * ((k % 16) / 4) + 8 * mi + 4 * (k / 16) + (k % 4);
+    };
+  }
+  virtual tile_layout_func_t B_tile_layout() const override {
+    return [](int n, int k) {
+      int ni = n % 16;
+      int no = n / 16;
+      return 512 * no + 128 * ((k % 16) / 4) + 8 * ni + 4 * (k / 16) + (k % 4);
+    };
+  }
+  virtual tile_layout_func_t C_tile_layout() const override {
+    return [](int m, int n) {
+      int mi = m % 16;
+      int mo = m / 16;
+      int ni = n % 16;
+      int no = n / 16;
+      return NS * 256 * mo + 256 * no + 64 * (mi / 4) + 4 * ni + (mi % 4);
+    };
+  }
+  // Standard MmtKernel interface method override describing number of threads.
+  virtual int num_threads() const override { return 256; }
+  // Additional constants and local helpers (static methods) for work-centric
+  // grid and auxiliary buffer allocation.
+  //
+  // Maximum number of Compute Units that we aim to use on sufficiently large
+  // problems. This value assumes a MI300X in SPX mode.
+  static constexpr int MaxWorkgroups = 304;
+  // Alignment to use when coalescing device buffers to avoid alignment-related
+  // performance caveats.
+  static constexpr int device_alignment = 128;
+  // Alignment to use for atomics to avoid false-sharing effects.
+  // Returns the number of Compute Units that we aim to use for the problem
+  // shape with given `outer` shape (expressed in units of this kernel's tiles).
+  static __device__ __host__ int get_workgroup_count(const MNKShape &outer) {
+    (void)outer;
+    return MaxWorkgroups;
+    // int64_t total_iters = static_cast<int64_t>(outer.M) * outer.N * outer.K;
+    // return std::min(static_cast<int64_t>(MaxWorkgroups), total_iters);
+  }
+  static __device__ __host__ int get_tile_count(const MNKShape &outer) {
+    return outer.M * outer.N;
+  }
+  // Returns the buffer bytes to allocate in the auxiliary buffer for the atomic
+  // counters.
+  using atomic_t = uint32_t;
+  static __device__ __host__ int atomics_buffer_size(const MNKShape &outer) {
+    return round_up_to_po2<device_alignment>(get_workgroup_count(outer) *
+                                             sizeof(atomic_t));
+  }
+  // Return the overall number of local accumulator buffers to allocate in the
+  // auxiliary buffer. This value is a coarse upper bound, could be
+  // refined to trim memory usage.
+  static __device__ __host__ int
+  local_accumulators_count(const MNKShape &outer) {
+    return get_workgroup_count(outer);
+  }
+  // Return the overall auxiliary buffer bytes to allocate.
+  static __device__ __host__ int
+  local_accumulators_buffer_size(const MNKShape &outer) {
+    return round_up_to_po2<device_alignment>(local_accumulators_count(outer) *
+                                             static_M_tile * static_N_tile *
+                                             type_size(static_C_type));
+  }
+  // Standard MmtKernel interface method override describing the work-centric
+  // grid.
+  virtual std::optional<dim3>
+  get_work_centric_grid(const MNKShape &outer) const override {
+    return {get_workgroup_count(outer)};
+  }
+  // Standard MmtKernel interface method override describing the auxiliary
+  // buffer size to allocate.
+  virtual int aux_buffer_size(const MNKShape &outer) const override {
+    return atomics_buffer_size(outer) + local_accumulators_buffer_size(outer);
+  }
+  // Standard MmtKernel interface method override describing the actual device
+  // kernel.
+  virtual mmt_func_t mmt_func() const override { return run; };
+  // Some typedefs used in the kernel implementation.
+  using floatx4_t = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+  using float16x4_t =
+      __attribute__((__vector_size__(4 * sizeof(_Float16)))) _Float16;
+  using float16x8_t =
+      __attribute__((__vector_size__(8 * sizeof(_Float16)))) _Float16;
+  static constexpr int num_acc_vec4s = MS * NS / 4;
+  using acc_array_t = std::array<floatx4_t, num_acc_vec4s>;
+  // Device kernel implementation.
+  __global__ __launch_bounds__(256) static void run(const void *A_data,
+                                                    const void *B_data,
+                                                    void *C_data,
+                                                    void *aux_data, int M_outer,
+                                                    int N_outer, int K_outer) {
+    int workgroup = blockIdx.x;
+    // Workgroup remapping for XCD locality
+    constexpr int NUM_XCDS = 8;
+    workgroup = (workgroup % NUM_XCDS) * (MaxWorkgroups / NUM_XCDS) +
+                (workgroup / NUM_XCDS);
+    MNKShape outer{M_outer, N_outer, K_outer};
+    // Data-parallel part: try to process as many whole tiles as possible in
+    // normal data-parallel mode.
+    int total_tiles = M_outer * N_outer;
+    int whole_tiles_per_workgroup = total_tiles / MaxWorkgroups;
+    int whole_tiles = whole_tiles_per_workgroup * MaxWorkgroups;
+    int this_workgroup_whole_tile_start = workgroup * whole_tiles_per_workgroup;
+    int this_workgroup_whole_tile_end =
+        (workgroup + 1) * whole_tiles_per_workgroup;
+    for (int tile_idx = this_workgroup_whole_tile_start;
+         tile_idx < this_workgroup_whole_tile_end; ++tile_idx) {
+      int m_outer = tile_idx / N_outer;
+      int n_outer = tile_idx - m_outer * N_outer;
+      acc_array_t acc =
+          mac_loop(A_data, B_data, K_outer, m_outer, n_outer, 0, K_outer);
+      acc_store(acc, static_cast<floatx4_t *>(C_data) +
+                         MS * NS * 16 * 4 * (N_outer * m_outer + n_outer));
+    }
+
+    // Early exit in the case of perfect sizes with no leftover tiles.
+    if (whole_tiles == total_tiles) {
+      return;
+    }
+
+    // There are leftover tiles, but by construction the number of leftover
+    // tiles is less than the number of workgroups. Set up a simple form of
+    // Stream-K to handle that cse.
+    int streamk_tile_start = whole_tiles;
+    int streamk_tile_end = total_tiles;
+    int streamk_tile_count = streamk_tile_end - streamk_tile_start;
+    int streamk_iter_count = streamk_tile_count * K_outer;
+    // Clamp the number of workgroups to return early if a workgroup would have
+    // no work to do. Also, round down the number of workgroups to the nearest
+    // multiple of the number of tiles. This ensures that a given workgroup only
+    // processes part of one tile. This considerably simplifies logic and
+    // scheduling, as that ensures that all workgroups have roughly the same
+    // amount of work, as opposed to having some workgroups dealing with
+    // two tiles.
+    int max_streamk_workgroups = std::min(streamk_iter_count, MaxWorkgroups);
+    int streamk_workgroups_per_tile =
+        max_streamk_workgroups / streamk_tile_count;
+    int streamk_workgroups = streamk_workgroups_per_tile * streamk_tile_count;
+    if (workgroup >= streamk_workgroups) {
+      return;
+    }
+    int streamk_tile_idx = workgroup / streamk_workgroups_per_tile;
+    int cooperating_workgroup_start =
+        streamk_tile_idx * streamk_workgroups_per_tile;
+    int cooperating_workgroup_end =
+        cooperating_workgroup_start + streamk_workgroups_per_tile;
+    int cooperating_workgroup_count =
+        cooperating_workgroup_end - cooperating_workgroup_start;
+    int workgroup_idx_in_cooperating_group =
+        workgroup - cooperating_workgroup_start;
+    int iter_start = workgroup_idx_in_cooperating_group * K_outer /
+                     cooperating_workgroup_count;
+    int iter_end = (workgroup_idx_in_cooperating_group + 1) * K_outer /
+                   cooperating_workgroup_count;
+
+    int m_outer = (streamk_tile_start + streamk_tile_idx) / N_outer;
+    int n_outer = (streamk_tile_start + streamk_tile_idx) - m_outer * N_outer;
+    // The arithmetic loop, computing the partial accumulators.
+    acc_array_t acc = mac_loop(A_data, B_data, K_outer, m_outer, n_outer,
+                               iter_start, iter_end);
+
+    assert(workgroup >= cooperating_workgroup_start);
+    assert(workgroup < cooperating_workgroup_end);
+
+    char *aux_bytes = static_cast<char *>(aux_data);
+    float *local_accumulators_buffer =
+        reinterpret_cast<float *>(aux_bytes + atomics_buffer_size(outer));
+
+    bool should_store_final_accumulator = true;
+
+    // Hard case: multiple workgroups cooperating on this tile.
+    if (cooperating_workgroup_count != 1) {
+      atomic_t *atomic_counter_base = reinterpret_cast<atomic_t *>(
+          aux_bytes + cooperating_workgroup_start * sizeof(atomic_t));
+
+      // Binary tree reduction.
+      int tree_depth = 32 - std::countl_zero(static_cast<uint32_t>(
+                                cooperating_workgroup_count - 1));
+      for (int tree_level = 0; tree_level < tree_depth; ++tree_level) {
+        int bit = 1 << tree_level;
+        // Determine the local accumulators to use. Clearing the low bits
+        // is a convention for where we store the higher nodes: we recycle the
+        // storage of the left leaf nodes.
+        int local_idx = workgroup_idx_in_cooperating_group & ~(bit - 1);
+        floatx4_t *local_accumulator = reinterpret_cast<floatx4_t *>(
+            local_accumulators_buffer +
+            (cooperating_workgroup_start + local_idx) * static_M_tile *
+                static_N_tile);
+        int sibling_idx = local_idx ^ bit;
+        floatx4_t *sibling_accumulator = reinterpret_cast<floatx4_t *>(
+            local_accumulators_buffer +
+            (cooperating_workgroup_start + sibling_idx) * static_M_tile *
+                static_N_tile);
+        int parent_idx =
+            (workgroup_idx_in_cooperating_group & ~((bit << 1) - 1));
+        // Check if we have a sibling.
+        if ((parent_idx | bit) >= cooperating_workgroup_count) {
+          // No sibling at this tree level. Continue to the next level.
+          continue;
+        }
+        // Unconditionally store the local accumulator. This is redundant in
+        // half of the cases (when this workgroup is the one performing the
+        // reduction, using the accumulators already present in its VGPRs).
+        // The point of doing that write unconditionally before the atomic
+        // operation is that after the atomic operation we will have proven
+        // that the write happened. Trying to save the redundant writes while
+        // preserving the wait-free aspect would require more atomics.
+        acc_store(acc, local_accumulator);
+        atomic_t *atomic_counter = atomic_counter_base + parent_idx;
+        // Perform the atomic operation to indicate that we have written our
+        // partial accumulator.
+        uint32_t counter_value = workgroup_atomic_or(atomic_counter, bit);
+        // Test if the sibling workgroup had written their partial accumulator
+        if (!(counter_value & bit)) {
+          // If we are here, then our sibling has not written its partial
+          // accumulator yet. We will break out of the tree reduction and let
+          // our sibling continue down the tree.
+          should_store_final_accumulator = false;
+          break;
+        }
+        // Perform the current level of binary tree reduction.
+        for (int i = 0; i < num_acc_vec4s; ++i) {
+          acc[i] += sibling_accumulator[256 * i + threadIdx.x];
+        }
+      }
+    }
+
+    if (should_store_final_accumulator) {
+      // Store the final accumulator to the destination.
+      // Note: consumer fusions go here.
+      acc_store(acc, static_cast<floatx4_t *>(C_data) +
+                         MS * NS * 16 * 4 * (N_outer * m_outer + n_outer));
+
+      // Reset atomic counters for the next kernel launch.
+      atomic_t *atomic_counter_base = reinterpret_cast<atomic_t *>(
+          aux_bytes + cooperating_workgroup_start * sizeof(atomic_t));
+      for (int i = 0; i < cooperating_workgroup_count; ++i)
+        atomic_counter_base[i] = 0;
     }
   }
   // Helper to store accumulators to memory.
@@ -3401,4 +3754,7 @@ int main() {
                                                                           8>());
   test(MmtKernel_StreamKTree_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2<
        8, 8>());
+  test(
+      MmtKernel_HybridStreamKTree_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2<
+          8, 8>());
 }

@@ -6,12 +6,14 @@
 
 #include "common.hip"
 
+#include <cassert>
 #include <cstdio>
 #include <cxxabi.h>
 #include <optional>
 #include <random>
 #include <typeinfo>
 #include <vector>
+#include <cstring>
 
 typedef void (*mmt_func_t)(const void *, const void *, void *, void *, int, int,
                            int);
@@ -2791,6 +2793,38 @@ class MmtKernel_StreamKTree_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
   }
 };
 
+// Given an arbitrary 2D grid shape MxN (not necessarily square or power-of-2)
+// and a linear index i, return a pair (x, y) where x is in [0 .. M-1] and
+// y is in [0 .. N-1] and, as i ranges in [0 .. M*N-1], the pair (x, y) visits
+// each position once, following a z-order curve to maximize locality.
+static __device__ std::tuple<int, int> zorder(int M, int N, int i) {
+  if (M == 1) {
+    return {0, i};
+  }
+  if (N == 1) {
+    return {i, 0};
+  }
+  int Mhalf = M / 2;
+  int Nhalf = N / 2;
+  int quadrant0 = Mhalf * Nhalf;
+  int quadrant1 = Mhalf * N;
+  int quadrant2 = quadrant1 + (M - Mhalf) * Nhalf;
+  if (i < quadrant0) {
+    auto [m, n] = zorder(Mhalf, Nhalf, i);
+    return {m, n};
+  }
+  if (i < quadrant1) {
+    auto [m, n] = zorder(Mhalf, N - Nhalf, i - quadrant0);
+    return {m, n + Nhalf};
+  }
+  if (i < quadrant2) {
+    auto [m, n] = zorder(M - Mhalf, Nhalf, i - quadrant1);
+    return {m + Mhalf, n};
+  }
+  auto [m, n] = zorder(M - Mhalf, N - Nhalf, i - quadrant2);
+  return {m + Mhalf, n + Nhalf};
+}
+
 template <int MS, int NS>
 class
     MmtKernel_HybridStreamKTree_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
@@ -2920,13 +2954,14 @@ class
     int total_tiles = M_outer * N_outer;
     int whole_tiles_per_workgroup = total_tiles / MaxWorkgroups;
     int whole_tiles = whole_tiles_per_workgroup * MaxWorkgroups;
-    int this_workgroup_whole_tile_start = workgroup * whole_tiles_per_workgroup;
+    int this_workgroup_whole_tile_start = workgroup;
     int this_workgroup_whole_tile_end =
-        (workgroup + 1) * whole_tiles_per_workgroup;
+        this_workgroup_whole_tile_start +
+        MaxWorkgroups * whole_tiles_per_workgroup;
+
     for (int tile_idx = this_workgroup_whole_tile_start;
-         tile_idx < this_workgroup_whole_tile_end; ++tile_idx) {
-      int m_outer = tile_idx / N_outer;
-      int n_outer = tile_idx - m_outer * N_outer;
+         tile_idx < this_workgroup_whole_tile_end; tile_idx += MaxWorkgroups) {
+      auto [m_outer, n_outer] = zorder(M_outer, N_outer, tile_idx);
       acc_array_t acc =
           mac_loop(A_data, B_data, K_outer, m_outer, n_outer, 0, K_outer);
       acc_store(acc, static_cast<floatx4_t *>(C_data) +
@@ -2972,9 +3007,8 @@ class
                      cooperating_workgroup_count;
     int iter_end = (workgroup_idx_in_cooperating_group + 1) * K_outer /
                    cooperating_workgroup_count;
-
-    int m_outer = (streamk_tile_start + streamk_tile_idx) / N_outer;
-    int n_outer = (streamk_tile_start + streamk_tile_idx) - m_outer * N_outer;
+    auto [m_outer, n_outer] =
+        zorder(M_outer, N_outer, streamk_tile_start + streamk_tile_idx);
     // The arithmetic loop, computing the partial accumulators.
     acc_array_t acc = mac_loop(A_data, B_data, K_outer, m_outer, n_outer,
                                iter_start, iter_end);

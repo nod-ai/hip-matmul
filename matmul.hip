@@ -2703,8 +2703,17 @@ class MmtKernel_StreamKTree_256t_MSxNS_amdgcn_mfma_f32_16x16x16f16_shared_Kx2
         // Reset atomic counters for the next kernel launch.
         atomic_t *atomic_counter_base = reinterpret_cast<atomic_t *>(
             aux_bytes + cooperating_workgroup_start * 2 * sizeof(atomic_t));
-        for (int i = 0; i < cooperating_workgroup_count; ++i)
-          atomic_counter_base[2 * i + (tile_idx & 1)] = 0;
+        // Only clear the counters that the tree reduction above actually used,
+        // i.e. 2 * parent_idx + nudge for each parent_idx that has a sibling.
+        // Clearing every 2 * i + nudge also clears counters that belong to a
+        // later tile of the same parity, whose first workgroup is among the
+        // workgroups of this tile when the tile in between fits in a single
+        // workgroup. That tile then never sees the other workgroup's bit and
+        // neither workgroup stores the final accumulator.
+        for (int bit = 1; bit < cooperating_workgroup_count; bit <<= 1)
+          for (int p = 0; (p | bit) < cooperating_workgroup_count;
+               p += bit << 1)
+            atomic_counter_base[2 * p + (tile_idx & 1)] = 0;
       }
 
       iter = tile_iter_end;

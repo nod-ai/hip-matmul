@@ -1,0 +1,98 @@
+name: GPU Simulator
+
+# Optional, non-required check. The hosted runners have no GPU, so this builds
+# matmul.hip with hipcc for gfx942 and runs a subset of its MFMA kernels on a
+# simulated AMD Instinct MI300X (https://github.com/pantheongpu/pantheonsim).
+# Each kernel is compared against the CPU reference in matmul.hip, which
+# abort()s on a mismatch. A simulator cannot reproduce hardware-specific
+# behavior or timing, so this complements real-GPU testing and does not
+# replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "matmul.hip"
+      - "common.hip"
+      - "build_and_test.sh"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  matmul:
+    name: matmul kernels (ROCm 7.2 and simulated MI300X)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and ROCm
+        uses: pantheongpu/setup-pantheonsim@deff5781e8adfd83dec98dd5242dcbc96a564773 # v0.1.10
+        with:
+          gpu: amd/mi300x
+          cuda-toolkit: none
+          rocm: "7.2"
+
+      - name: Install ROCm runtime libraries
+        run: sudo apt-get install -y comgr hsa-rocr
+
+      # Same command as build_and_test.sh, with the gfx942 target added.
+      - name: Build
+        run: |
+          mkdir -p build
+          hipcc matmul.hip -std=c++20 -O2 --offload-arch=gfx942 -o build/hip-matmul
+
+      # Every selected kernel is checked against the CPU reference on 14
+      # shapes (matmul.hip abort()s on a mismatch), then launched once at
+      # 256x256x256 with the benchmark loop cut to one iteration. FILTER picks
+      # kernels by demangled name; each filter must match and pass at least
+      # one kernel. Not run: the Kx2 fp16 StreamK/pipelined variants and the
+      # remaining f32/i8 template instances (time), and matvec.hip.
+      - name: Run
+        env:
+          M: "256"
+          N: "256"
+          K: "256"
+          FIXED_ITERATIONS: "1"
+        run: |
+          : > matmul.log
+          while read -r filter; do
+            echo "=== FILTER=${filter}"
+            FILTER="$filter" vgpu run build/hip-matmul </dev/null 2>&1 | tee run.out
+            test "${PIPESTATUS[0]}" -eq 0
+            grep -q "Checking correctness... OK" run.out
+            cat run.out >> matmul.log
+          done <<'EOF_FILTERS'
+          MmtKernel_generic
+          mfma_f32_16x16x4f32_rowmajor
+          mfma_f32_16x16x4f32_direct_Kx4
+          mfma_f32_16x16x4f32_shared<8, 8>
+          mfma_f32_16x16x4f32_shared_Kx4<8, 8>
+          mfma_f32_16x16x16f16_shared<8, 8>
+          mfma_i32_16x16x32i8_shared<8, 8>
+          mfma_i32_16x16x32i8_shared_Kx2_pipeline_v3
+          mfma_i32_32x32x16i8_shared<8, 8>
+          EOF_FILTERS
+
+      # A wrong result abort()s the program; a run that executed nothing
+      # must fail too.
+      - name: Check the kernels ran on the device
+        run: |
+          ok=$(grep -c "Checking correctness... OK" matmul.log)
+          echo "kernels checked: ${ok}"
+          test "$ok" -ge 9
+          ! grep -Ei "numerical error|VirtualGPU error|no device|no ROCm-capable|skip" matmul.log
